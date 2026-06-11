@@ -38,12 +38,19 @@ TCP_PORTS="${TCP_PORTS:-443,2087}"
 UDP_PORTS="${UDP_PORTS:-443,2087}"
 NODE_PORT="${NODE_PORT:-2222}"
 WHITELIST="${WHITELIST:-}"
-SYN_RATE="${SYN_RATE:-100}";  SYN_BURST="${SYN_BURST:-200}"
+SYN_RATE="${SYN_RATE:-200}";  SYN_BURST="${SYN_BURST:-400}"
 UDP_RATE="${UDP_RATE:-200}";  UDP_BURST="${UDP_BURST:-400}"
-CONN_LIMIT="${CONN_LIMIT:-600}"
+# CONN_LIMIT — потолок ОДНОВРЕМЕННЫХ конн. с одного IP. За CGNAT (мобильные операторы,
+# частый кейс в RU/IR) один egress-IP агрегирует много абонентов → держим с большим
+# запасом, чтобы не рубить целые операторские пулы. Реальный VLESS-юзер — десятки конн.
+CONN_LIMIT="${CONN_LIMIT:-2048}"
+ICMP_RATE="${ICMP_RATE:-10}"; ICMP_BURST="${ICMP_BURST:-20}"   # PER-IP (не глобально)
 SSH_RATE="${SSH_RATE:-6}";    SSH_BURST="${SSH_BURST:-5}"
 SSH_BAN_TIME="${SSH_BAN_TIME:-24h}"
 PORTSCAN_BAN_TIME="${PORTSCAN_BAN_TIME:-1h}"
+# Порог автобана за скан: банить IP только если он бьёт по закрытым портам БЫСТРЕЕ
+# порога (реальный сканер). Одиночные шальные SYN из CGNAT-пула не банят весь оператор.
+PORTSCAN_RATE="${PORTSCAN_RATE:-15}"; PORTSCAN_BURST="${PORTSCAN_BURST:-30}"  # /minute, per-IP
 ENABLE_PORTSCAN_BAN="${ENABLE_PORTSCAN_BAN:-1}"
 ENABLE_CROWDSEC="${ENABLE_CROWDSEC:-1}"
 ENABLE_SYNPROXY="${ENABLE_SYNPROXY:-0}"
@@ -156,10 +163,13 @@ fi
 # portscan → autoban (включается флагом)
 PORTSCAN=""
 if [[ "$ENABLE_PORTSCAN_BAN" == "1" ]]; then
-    PORTSCAN="        # ANTI-SCAN: новый SYN на несервисный порт = скан → лог(rl) + автобан
+    PORTSCAN="        # ANTI-SCAN: SYN на несервисный порт. Бан НЕ по одному пакету (иначе за CGNAT
+        # один шальной коннект банит весь оператор на ${PORTSCAN_BAN_TIME}), а только если IP
+        # бьёт по закрытым портам быстрее ${PORTSCAN_RATE}/min — это реальный сканер. Шальные
+        # одиночные SYN под порогом просто молча дропаются финальным правилом ниже, без бана.
         meta nfproto ipv4 tcp flags & (fin|syn|rst|ack) == syn ct state new limit rate 5/second log prefix \"[na portscan] \" level info
-        meta nfproto ipv4 tcp flags & (fin|syn|rst|ack) == syn ct state new add @autoban_v4 { ip saddr timeout ${PORTSCAN_BAN_TIME} } drop
-        meta nfproto ipv6 tcp flags & (fin|syn|rst|ack) == syn ct state new add @autoban_v6 { ip6 saddr timeout ${PORTSCAN_BAN_TIME} } drop"
+        meta nfproto ipv4 tcp flags & (fin|syn|rst|ack) == syn ct state new meter ps4 { ip saddr limit rate over ${PORTSCAN_RATE}/minute burst ${PORTSCAN_BURST} packets } add @autoban_v4 { ip saddr timeout ${PORTSCAN_BAN_TIME} } drop
+        meta nfproto ipv6 tcp flags & (fin|syn|rst|ack) == syn ct state new meter ps6 { ip6 saddr limit rate over ${PORTSCAN_RATE}/minute burst ${PORTSCAN_BURST} packets } add @autoban_v6 { ip6 saddr timeout ${PORTSCAN_BAN_TIME} } drop"
 fi
 
 # опциональный synproxy (по умолчанию off — требует совпадения mss/wscale)
@@ -258,11 +268,12 @@ $ANTISPOOF
         tcp flags & (psh|ack) == psh                                       jump scan_drop
         tcp flags & (ack|urg) == urg                                       jump scan_drop
 
-        # ICMP: пинг работает, флуд режется
-        ip protocol icmp icmp type echo-request limit rate 10/second burst 20 packets accept
+        # ICMP: пинг работает, флуд режется. Лимит PER-IP (meter), НЕ глобальный — иначе
+        # нода с сотнями пингующих клиентов упирается в общий потолок и пинг «пропадает».
+        ip protocol icmp icmp type echo-request meter icmp4 { ip saddr limit rate ${ICMP_RATE}/second burst ${ICMP_BURST} packets } accept
         ip protocol icmp icmp type echo-request drop
         ip protocol icmp icmp type { destination-unreachable, time-exceeded, parameter-problem } accept
-        icmpv6 type echo-request limit rate 10/second burst 20 packets accept
+        icmpv6 type echo-request meter icmp6 { ip6 saddr limit rate ${ICMP_RATE}/second burst ${ICMP_BURST} packets } accept
         icmpv6 type echo-request drop
         icmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert, packet-too-big, time-exceeded, parameter-problem, destination-unreachable, mld-listener-query, mld-listener-report, mld-listener-done } accept
 
