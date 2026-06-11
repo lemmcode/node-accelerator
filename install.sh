@@ -11,11 +11,15 @@
 #
 # curl-bash:
 #   curl -fsSL https://raw.githubusercontent.com/jestivald/node-accelerator/main/install.sh | sudo bash -s all
+#   # прод: пиньте тег (компрометация ветки main тогда не утечёт сразу на весь флот):
+#   export NA_REF=v2.1; curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF/install.sh" | sudo -E bash -s all
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS="$SCRIPT_DIR/scripts"
-REPO_URL="${NA_REPO_URL:-https://raw.githubusercontent.com/jestivald/node-accelerator/main}"
+# NA_REF — ветка/тег для curl|bash-режима (по умолчанию main). Для прода пиньте тег.
+NA_REF="${NA_REF:-main}"
+REPO_URL="${NA_REPO_URL:-https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF}"
 
 # curl|bash — подтянуть модули
 if [[ ! -d "$SCRIPTS" ]]; then

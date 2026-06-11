@@ -17,7 +17,7 @@ WHAT="${1:-all}"
 
 rollback_optimize() {
     title "Откат: ⚡ optimize"
-    rm -f /etc/sysctl.d/99-node-accelerator.conf
+    rm -f /etc/sysctl.d/99-node-accelerator.conf /etc/sysctl.d/99-node-accelerator-conntrack.conf
     rm -f /etc/modules-load.d/na-bbr.conf /etc/modules-load.d/na-conntrack.conf
     rm -f /etc/systemd/system.conf.d/na-limits.conf /etc/systemd/user.conf.d/na-limits.conf
     rm -f /etc/systemd/journald.conf.d/na-size.conf
@@ -40,6 +40,9 @@ rollback_optimize() {
             info "Удаляю XanMod-пакет $pkg ..."
             DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq "$pkg" >/dev/null 2>&1 || warn "не удалил $pkg"
             update-grub >/dev/null 2>&1 || true
+            # репозиторий и ключ больше не нужны — чистим, чтобы apt не ругался на suite
+            rm -f /etc/apt/sources.list.d/xanmod*.list /etc/apt/keyrings/xanmod-archive-keyring.gpg
+            apt-get update -qq 2>/dev/null || true
         else
             warn "XanMod ($pkg) оставлен. Сейчас грузимся: $(uname -r)."
             warn "Чтобы убрать: загрузись со стокового ядра и запусти NA_REMOVE_XANMOD=1 rollback optimize."
@@ -61,7 +64,7 @@ rollback_protect() {
     # удаляем ТОЛЬКО свою таблицу — CrowdSec/Docker не трогаем
     nft delete table inet na_filter 2>/dev/null || true
     rm -f "$CONF_DIR/na_filter.nft"
-    rm -f /usr/local/sbin/na-fw-status
+    rm -f /usr/local/sbin/na-fw-status /usr/local/sbin/na-fw-top-talkers
     rm -f "$STATE_DIR/protect.installed"
     ok "na_filter удалена, сервис снят"
 

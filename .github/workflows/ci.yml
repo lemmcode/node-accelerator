@@ -1,0 +1,58 @@
+name: ci
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  # ── Статический анализ всех скриптов ────────────────────────────────────────
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+      - name: Gate (severity=error — блокирует merge)
+        run: shellcheck -x --severity=error install.sh scripts/*.sh scripts/lib/*.sh
+      - name: Report (severity=style — информационно, не блокирует)
+        continue-on-error: true
+        run: shellcheck -x --severity=style install.sh scripts/*.sh scripts/lib/*.sh
+
+  # ── Smoke-тесты на матрице дистрибутивов ────────────────────────────────────
+  # Ловит ровно тот класс регрессий, из-за которых появился этот PR: установка
+  # XanMod на разных Ubuntu/Debian и генерация nftables-ruleset.
+  smoke:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - "debian:bookworm"
+          - "debian:trixie"
+          - "ubuntu:22.04"   # jammy → подменяется на bookworm
+          - "ubuntu:24.04"   # noble
+    container:
+      image: ${{ matrix.image }}
+      # protect.sh DRY_RUN вызывает 'nft -c', который валидирует ruleset через netlink
+      # к netfilter ядра — без CAP_NET_ADMIN это «Operation not permitted». --privileged
+      # даёт те же права, что есть у скрипта на реальной ноде под root.
+      options: --privileged
+    steps:
+      - name: Install git (нужен checkout) + базовые сертификаты
+        run: apt-get update -qq && apt-get install -y -qq --no-install-recommends git ca-certificates
+      - uses: actions/checkout@v4
+      - name: Prep container + runtime-зависимости
+        run: |
+          # Запрещаем запуск сервисов из postinst (в контейнере нет systemd как PID1)
+          printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d && chmod +x /usr/sbin/policy-rc.d
+          apt-get install -y -qq --no-install-recommends \
+            bash curl gnupg nftables iproute2 gawk procps kmod coreutils irqbalance ethtool
+      - name: Syntax (bash -n)
+        run: bash -n install.sh scripts/*.sh scripts/lib/*.sh
+      - name: protect.sh DRY_RUN (генерация + nft -c, без применения)
+        run: DRY_RUN=1 REMNAWAVE_NONINTERACTIVE=1 bash scripts/protect.sh
+      - name: diagnose.sh (read-only, не должен падать жёстко)
+        run: bash scripts/diagnose.sh || true
+      - name: XanMod репозиторий+ключ+кандидат резолвятся (без установки ядра)
+        run: XANMOD_PROBE=1 ENABLE_XANMOD=1 bash scripts/optimize.sh
