@@ -19,14 +19,41 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 . "$SCRIPT_DIR/lib/common.sh"
 
+# Прячем курсор для прогресс-бара установки ядра ниже; гарантированно возвращаем его
+# при любом выходе, включая Ctrl-C, чтобы не оставить терминал с невидимым курсором.
+trap 'tput cnorm 2>/dev/null || true' EXIT
+trap 'tput cnorm 2>/dev/null || true; exit 130' INT
+
 require_root
 detect_os
+
+# Подчищаем ТОЛЬКО XanMod-репозитории с мёртвыми suite (focal/jammy/releases выпилены
+# из репо) — их 404 роняет 'apt-get update' на повторном прогоне через set -e. Рабочий
+# list НЕ трогаем: иначе на уже настроенной ноде молча отключатся обновления ядра.
+for _l in /etc/apt/sources.list.d/xanmod*.list; do
+    [[ -e "$_l" ]] || continue
+    if grep -qE 'deb\.xanmod\.org[[:space:]]+(focal|jammy|releases)([[:space:]]|$)' "$_l" 2>/dev/null; then
+        rm -f "$_l"
+    fi
+done
+unset _l
 
 ENABLE_XANMOD="${ENABLE_XANMOD:-1}"
 XANMOD_FLAVOR="${XANMOD_FLAVOR:-lts}"
 BACKUP="$(backup_dir)"
 REBOOT_NEEDED=0
 info "Бэкап изменяемых файлов: $BACKUP"
+
+# Прогресс-бар установки ядра (рисуется по APT::Status-Fd в install_xanmod).
+draw_progress_bar() {
+    local percent=$1 desc=$2 width=30 i bar=""
+    local filled=$((percent * width / 100)) empty=$((width - filled))
+    for ((i=0; i<filled; i++)); do bar+="#"; done
+    for ((i=0; i<empty;  i++)); do bar+="-"; done
+    local maxlen=35
+    [[ ${#desc} -gt $maxlen ]] && desc="${desc:0:$((maxlen-3))}..."
+    printf "\r[*] [%s] %3d%% (%s)\033[K" "$bar" "$percent" "$desc"
+}
 
 # ─── 1. Зависимости ──────────────────────────────────────────────────────────
 title "Зависимости"
@@ -35,62 +62,140 @@ ok "ok"
 
 # ─── 2. XanMod-ядро (BBRv3) ──────────────────────────────────────────────────
 title "XanMod-ядро (BBRv3)"
-install_xanmod() {
-    local codename keyring=/etc/apt/keyrings/xanmod-archive-keyring.gpg
-    local list=/etc/apt/sources.list.d/xanmod-release.list
-    codename="$(os_codename)"
+# Полный отпечаток ключа подписи XanMod (keyid 86F7D09EE734E623 — последние 16 hex).
+# Проверяем именно его: 64-битный keyid подделать дёшево, полный fingerprint — нет.
+XANMOD_FP="D38D7D1DA1349567ADED882D86F7D09EE734E623"
 
+# Импорт ключа: 1) напрямую с XanMod; 2) при блокировке (CF-403 типичен для Hetzner/GCP)
+# — с Ubuntu keyserver. Что бы ни сработало — сверяем полный отпечаток.
+xanmod_import_key() {
+    local keyring="$1"
     mkdir -p /etc/apt/keyrings
-    if ! curl -fsSL https://dl.xanmod.org/archive.key | gpg --dearmor -o "$keyring" 2>/dev/null; then
-        warn "Не скачал ключ XanMod — пропускаю установку ядра"; return 1
+    if ! curl -fsSL --connect-timeout 5 --max-time 20 https://dl.xanmod.org/archive.key \
+            | gpg --yes --dearmor -o "$keyring" 2>/dev/null; then
+        warn "dl.xanmod.org недоступен (обычно CF-403 на хостингах) — пробую Ubuntu keyserver…"
+        curl -fsSL --connect-timeout 5 --max-time 20 \
+                "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${XANMOD_FP: -16}" \
+            | gpg --yes --dearmor -o "$keyring" 2>/dev/null \
+            || { warn "Ключ XanMod недоступен ни напрямую, ни с keyserver"; return 1; }
+    fi
+    if ! gpg --show-keys --with-colons "$keyring" 2>/dev/null \
+            | awk -F: '/^fpr:/{print $10}' | grep -qx "$XANMOD_FP"; then
+        warn "Отпечаток ключа XanMod не совпал с $XANMOD_FP — отказываюсь использовать"
+        rm -f "$keyring"; return 1
     fi
     chmod 0644 "$keyring"
+}
 
-    # Сначала пробуем по codename (новый формат репо), при неудаче — releases (старый).
-    echo "deb [signed-by=$keyring] http://deb.xanmod.org ${codename:-releases} main" > "$list"
+# Готовим репозиторий XanMod (ключ + sources.list + apt update). Идемпотентно;
+# вызывается и при установке, и для уже стоящего ядра (чтобы не заморозить обновления).
+setup_xanmod_repo() {
+    local keyring=/etc/apt/keyrings/xanmod-archive-keyring.gpg
+    local list=/etc/apt/sources.list.d/xanmod-release.list
+    local codename; codename="$(os_codename)"
+
+    # focal/jammy выпилены из XanMod-репо → совместимый Debian 'bookworm' (LTS-ветка ядра).
+    case "$codename" in
+        focal|jammy)
+            info "Ubuntu $codename: suite выпилен из XanMod-репо → беру 'bookworm' + lts-сборку"
+            codename="bookworm"; XANMOD_FLAVOR="lts" ;;
+        "") codename="bookworm" ;;   # релиз не определён — берём универсальный LTS-suite
+    esac
+
+    xanmod_import_key "$keyring" || return 1
+
+    echo "deb [signed-by=$keyring] http://deb.xanmod.org $codename main" > "$list"
     if ! apt-get update -qq 2>/dev/null; then
-        warn "Репозиторий по '$codename' не поднялся, пробую 'releases'"
-        echo "deb [signed-by=$keyring] http://deb.xanmod.org releases main" > "$list"
-        apt-get update -qq 2>/dev/null || { warn "XanMod-репо недоступен"; return 1; }
+        if [[ "$codename" != "bookworm" ]]; then
+            warn "Suite '$codename' не поднялся — откатываюсь на 'bookworm' (LTS)"
+            codename="bookworm"; XANMOD_FLAVOR="lts"
+            echo "deb [signed-by=$keyring] http://deb.xanmod.org $codename main" > "$list"
+            apt-get update -qq 2>/dev/null || { warn "XanMod-репо недоступен"; rm -f "$list"; return 1; }
+        else
+            warn "XanMod-репо ('bookworm') недоступен"; rm -f "$list"; return 1
+        fi
     fi
+    return 0
+}
 
-    # Выбор сборки: явный XANMOD_PKG > по psABI-уровню. Деградация v3→v2→v1.
-    local lvl pkg flv="$XANMOD_FLAVOR" pref=""
-    [[ "$flv" == "lts" ]] && pref="lts-"
-    [[ "$flv" == "main" ]] && pref=""
-    [[ "$flv" == "edge" ]] && pref="edge-"
-    [[ "$flv" == "rt"  ]] && pref="rt-"
-    lvl="$(cpu_psabi_level)"
-    info "psABI уровень CPU: x86-64-v$lvl, сборка: ${flv}"
+# Список пакетов-кандидатов по psABI-уровню (деградация v3→v2→v1). Вынесено отдельно,
+# чтобы install_xanmod и XANMOD_PROBE брали кандидатов из одного источника.
+xanmod_candidates() {
+    local flv="$XANMOD_FLAVOR" pref="" lvl
+    case "$flv" in lts) pref="lts-";; edge) pref="edge-";; rt) pref="rt-";; *) pref="";; esac
+    lvl="$(cpu_psabi_level)"; [[ "$lvl" =~ ^[1-4]$ ]] || lvl=2
+    if [[ -n "${XANMOD_PKG:-}" ]]; then echo "$XANMOD_PKG"; return; fi
+    case "$lvl" in
+        4|3) echo "linux-xanmod-${pref}x64v3 linux-xanmod-${pref}x64v2 linux-xanmod-lts-x64v2";;
+        2)   echo "linux-xanmod-${pref}x64v2 linux-xanmod-lts-x64v2";;
+        *)   echo "linux-xanmod-lts-x64v1";;
+    esac
+}
 
-    local candidates=()
-    if [[ -n "${XANMOD_PKG:-}" ]]; then
-        candidates=("$XANMOD_PKG")
-    else
-        case "$lvl" in
-            4|3) candidates=("linux-xanmod-${pref}x64v3" "linux-xanmod-${pref}x64v2" "linux-xanmod-lts-x64v2");;
-            2)   candidates=("linux-xanmod-${pref}x64v2" "linux-xanmod-lts-x64v2");;
-            *)   candidates=("linux-xanmod-lts-x64v1");;
-        esac
-    fi
+install_xanmod() {
+    setup_xanmod_repo || return 1
+    info "psABI уровень CPU: x86-64-v$(cpu_psabi_level), сборка: $XANMOD_FLAVOR"
 
-    local p
+    local p pkg="" err_log candidates
+    read -ra candidates <<< "$(xanmod_candidates)"
     for p in "${candidates[@]}"; do
-        if apt-cache show "$p" >/dev/null 2>&1; then
-            info "Ставлю $p (это надолго — компилит initramfs)..."
-            if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$p" >/dev/null 2>&1; then
-                pkg="$p"; break
-            fi
+        apt-cache show "$p" >/dev/null 2>&1 || continue
+        info "Ставлю $p (это надолго — компилит initramfs)…"
+        err_log="$(mktemp)"
+        tput civis 2>/dev/null || true
+        # APT::Status-Fd=1 → машинный прогресс в stdout; stdbuf -oL снимает буферизацию пайпа.
+        # pkg НЕ трогаем в subshell справа от пайпа (там только отрисовка) — ставим в родителе.
+        if DEBIAN_FRONTEND=noninteractive stdbuf -oL \
+                apt-get -o APT::Status-Fd=1 install -y "$p" 2>"$err_log" \
+                | while IFS=: read -r f1 f2 f3 f4 _r; do
+                    case "$f1" in
+                        pmstatus|dlstatus)
+                            pct="$f3"; dsc="$f4"
+                            if ! [[ "$pct" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+                                if [[ "$f2" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then pct="$f2"; dsc="$f3"; else continue; fi
+                            fi
+                            pct="${pct%%.*}"
+                            [[ "$pct" =~ ^[0-9]+$ ]] || continue
+                            [[ "$pct" -gt 100 ]] && pct=100
+                            [[ "$f1" == "dlstatus" ]] && act="Загрузка" || act="Установка"
+                            draw_progress_bar "$pct" "$act: $dsc"
+                            ;;
+                    esac
+                done
+        then
+            printf "\r\033[K"; tput cnorm 2>/dev/null || true
+            rm -f "$err_log"; pkg="$p"; break
+        else
+            printf "\r\033[K"; tput cnorm 2>/dev/null || true
+            warn "Сборка $p не установилась — пробую следующую. Хвост ошибки:"
+            tail -n 3 "$err_log" >&2; rm -f "$err_log"
         fi
     done
-    [[ -z "${pkg:-}" ]] && { warn "Ни одна сборка XanMod не поставилась"; return 1; }
+    [[ -z "$pkg" ]] && { warn "Ни одна сборка XanMod не поставилась"; return 1; }
 
-    echo "$pkg" > "$STATE_DIR/xanmod.pkg" 2>/dev/null || { mkdir -p "$STATE_DIR"; echo "$pkg" > "$STATE_DIR/xanmod.pkg"; }
+    mkdir -p "$STATE_DIR"; echo "$pkg" > "$STATE_DIR/xanmod.pkg"
     update-grub >/dev/null 2>&1 || true
     ok "XanMod установлен: $pkg (активируется ПОСЛЕ перезагрузки)"
     REBOOT_NEEDED=1
     return 0
 }
+
+# PROBE: проверить, что репозиторий+ключ+кандидат резолвятся на этой ОС, БЕЗ установки.
+# Используется в CI (матрица дистрибутивов) и как ops-проба. Обходит гейт «контейнер».
+if [[ "${XANMOD_PROBE:-0}" == "1" ]]; then
+    setup_xanmod_repo || { err "XANMOD_PROBE: репозиторий не поднялся"; exit 1; }
+    cand="$(xanmod_candidates)"; info "кандидаты: $cand"
+    for p in $cand; do
+        if apt-cache show "$p" >/dev/null 2>&1; then
+            ok "XANMOD_PROBE: '$p' доступен в репозитории"
+            DEBIAN_FRONTEND=noninteractive apt-get install --download-only -y "$p" >/dev/null 2>&1 \
+                && ok "XANMOD_PROBE: '$p' скачивается" \
+                || warn "XANMOD_PROBE: '$p' в индексе есть, но download-only не прошёл (зависимости дистрибутива)"
+            exit 0
+        fi
+    done
+    err "XANMOD_PROBE: ни один кандидат не доступен"; exit 1
+fi
 
 if [[ "$ENABLE_XANMOD" == "1" ]]; then
     if ! can_install_kernel; then
@@ -101,7 +206,8 @@ if [[ "$ENABLE_XANMOD" == "1" ]]; then
             warn "Архитектура $(arch) — XanMod только под x86_64. Пропускаю ядро."
         fi
     elif uname -r | grep -q xanmod; then
-        ok "XanMod уже стоит ($(uname -r)) — пропускаю установку"
+        ok "XanMod уже стоит ($(uname -r)) — обновляю только репозиторий (чтобы шли апдейты ядра)"
+        setup_xanmod_repo || warn "репозиторий XanMod не обновлён (само ядро не тронуто)"
     else
         install_xanmod || warn "XanMod не установлен — продолжаю с текущим ядром"
     fi
@@ -159,10 +265,10 @@ net.ipv4.ip_forward               = 1
 net.ipv4.conf.all.forwarding      = 1
 net.ipv6.conf.all.forwarding      = 1
 
-# --- Conntrack: тысячи одновременных соединений ---
-net.netfilter.nf_conntrack_max                     = 2000000
+# --- Conntrack: timeout здесь; ёмкость (max/buckets) — отдельным drop-in ниже,
+# масштабируется от RAM (99-node-accelerator-conntrack.conf), чтобы мелкая VPS под
+# флудом не словила OOM в ядре ---
 net.netfilter.nf_conntrack_tcp_timeout_established = 7440
-net.netfilter.nf_conntrack_buckets                 = 500000
 
 # --- SYN flood (ядро) ---
 net.ipv4.tcp_syncookies           = 1
@@ -199,6 +305,20 @@ fs.nr_open                    = 2097152
 fs.inotify.max_user_watches   = 524288
 fs.inotify.max_user_instances = 8192
 SYSCTL
+
+# Ёмкость conntrack под RAM ноды: ~320 B на запись, держим таблицу ≤ ~1/8 RAM, чтобы
+# под флудом мелкая VPS не упёрлась в OOM ядра. Потолок 2M, пол 262144 (как было).
+_mem_kb="$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 1048576)"
+CT_MAX=$(( _mem_kb * 1024 / 8 / 320 ))
+[[ "$CT_MAX" -gt 2000000 ]] && CT_MAX=2000000
+[[ "$CT_MAX" -lt 262144  ]] && CT_MAX=262144
+CT_BUCKETS=$(( CT_MAX / 4 ))
+cat > /etc/sysctl.d/99-node-accelerator-conntrack.conf <<CT
+# node-accelerator: ёмкость conntrack под RAM этой ноды (~$(( _mem_kb / 1024 )) MB)
+net.netfilter.nf_conntrack_max     = $CT_MAX
+net.netfilter.nf_conntrack_buckets = $CT_BUCKETS
+CT
+info "conntrack: max=$CT_MAX buckets=$CT_BUCKETS (под ~$(( _mem_kb / 1024 )) MB RAM)"
 
 modprobe tcp_bbr 2>/dev/null || true
 modprobe nf_conntrack 2>/dev/null || true
