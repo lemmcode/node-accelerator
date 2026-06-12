@@ -80,13 +80,31 @@ _is_port "$NODE_PORT" || { err "NODE_PORT '$NODE_PORT' невалиден"; exit
 validate_port_list "$TCP_PORTS" TCP_PORTS || exit 1
 validate_port_list "$UDP_PORTS" UDP_PORTS || exit 1
 
+# Числовые/duration параметры тоже валидируем: они разворачиваются в nft-ruleset и
+# (SAFETY_DELAY) в sh-таймер. Тулкит параметризуется неинтерактивно из панели/оркестратора,
+# поэтому непровалидированный ENV здесь — не «root сам себе», а реальный вектор.
+_is_uint()     { [[ "$1" =~ ^[0-9]+$ ]]; }
+_is_duration() { [[ "$1" =~ ^[0-9]+(s|m|h|d)?$ ]]; }
+for _k in SYN_RATE SYN_BURST UDP_RATE UDP_BURST CONN_LIMIT ICMP_RATE ICMP_BURST \
+          SSH_RATE SSH_BURST PORTSCAN_RATE PORTSCAN_BURST SAFETY_DELAY; do
+    _is_uint "${!_k}" || { err "$_k='${!_k}' — ожидается целое число"; exit 1; }
+done
+for _k in SSH_BAN_TIME PORTSCAN_BAN_TIME; do
+    _is_duration "${!_k}" || { err "$_k='${!_k}' — ожидается число с опц. суффиксом s|m|h|d"; exit 1; }
+done
+unset _k
+
 # whitelist → v4/v6
 WL4=""; WL6=""
 add_wl() {
     local x
     for x in ${1//,/ }; do
         [[ -z "$x" ]] && continue
-        if [[ "$x" == *:* ]]; then WL6+="${WL6:+, }$x"
+        if [[ "$x" == *:* ]]; then
+            # строго hex+двоеточия (+опц. /prefix) — иначе значение уходит дословно в
+            # nft-heredoc 'elements = { ... }' и может дописать произвольные правила
+            [[ "$x" =~ ^[0-9a-fA-F:]+(/[0-9]{1,3})?$ ]] || { err "WHITELIST: '$x' не валидный IPv6/CIDR"; return 1; }
+            WL6+="${WL6:+, }$x"
         elif [[ "$x" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]; then WL4+="${WL4:+, }$x"
         else err "WHITELIST: '$x' не IPv4/IPv6/CIDR"; return 1; fi
     done
@@ -114,16 +132,22 @@ arm_safety() {
             /usr/sbin/nft delete table inet na_filter >/dev/null 2>&1 \
             && { ok "safety: systemd-таймер na-fw-safety на ${SAFETY_DELAY}s"; return 0; }
     fi
-    # fallback
-    [[ -f /tmp/na-fw-safety.pid ]] && { kill "$(cat /tmp/na-fw-safety.pid)" 2>/dev/null || true; }
-    nohup sh -c "sleep ${SAFETY_DELAY}; /usr/sbin/nft delete table inet na_filter 2>/dev/null; rm -f /tmp/na-fw-safety.pid" \
-        >/tmp/na-fw-safety.log 2>&1 &
-    echo $! > /tmp/na-fw-safety.pid
-    ok "safety: nohup pid $(cat /tmp/na-fw-safety.pid)"
+    # fallback (нет systemd-run): nohup-таймер. Стейт в $STATE_DIR (root-only), НЕ в общей
+    # /tmp — убирает симлинк/TOCTOU через предсказуемый путь. SAFETY_DELAY и pid передаём
+    # позиционными аргументами в sh -c (без интерполяции в строку оболочки).
+    mkdir -p "$STATE_DIR"
+    local pidf="$STATE_DIR/na-fw-safety.pid" logf="$STATE_DIR/na-fw-safety.log"
+    [[ -f "$pidf" && ! -L "$pidf" ]] && { kill "$(cat "$pidf")" 2>/dev/null || true; }
+    nohup sh -c 'sleep "$1"; /usr/sbin/nft delete table inet na_filter 2>/dev/null; rm -f "$2"' \
+        _ "$SAFETY_DELAY" "$pidf" >"$logf" 2>&1 &
+    echo $! > "$pidf"
+    ok "safety: nohup pid $(cat "$pidf")"
 }
 disarm_safety() {
     systemctl stop na-fw-safety.timer 2>/dev/null || true
-    [[ -f /tmp/na-fw-safety.pid ]] && { kill "$(cat /tmp/na-fw-safety.pid)" 2>/dev/null || true; rm -f /tmp/na-fw-safety.pid; }
+    local pidf="$STATE_DIR/na-fw-safety.pid"
+    [[ -f "$pidf" && ! -L "$pidf" ]] && { kill "$(cat "$pidf")" 2>/dev/null || true; rm -f "$pidf"; }
+    rm -f /tmp/na-fw-safety.pid /tmp/na-fw-safety.log 2>/dev/null || true   # legacy-стейт старых версий
 }
 
 # ─── Сборка per-port правил ──────────────────────────────────────────────────
@@ -351,7 +375,9 @@ if [[ "$ENABLE_CROWDSEC" == "1" ]]; then
     title "CrowdSec + nftables firewall-bouncer"
     if ! command -v cscli >/dev/null 2>&1; then
         info "Подключаю репозиторий CrowdSec..."
-        curl -s https://install.crowdsec.net | bash >/dev/null 2>&1 || warn "install.crowdsec.net недоступен"
+        # -fsSL (а не -s): при HTTP-ошибке/редиректе curl падает, а не отдаёт HTML в bash.
+        # Это официальный установщик CrowdSec; для жёсткого пиннинга — ставить из их APT-репо.
+        curl -fsSL https://install.crowdsec.net | bash >/dev/null 2>&1 || warn "install.crowdsec.net недоступен"
         DEBIAN_FRONTEND=noninteractive apt-get install -y -qq crowdsec >/dev/null 2>&1 || warn "crowdsec не установился"
     fi
     if command -v cscli >/dev/null 2>&1; then

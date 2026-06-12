@@ -55,7 +55,9 @@ rollback_optimize() {
 rollback_protect() {
     title "Откат: 🛡 protect"
     systemctl stop na-fw-safety.timer 2>/dev/null || true
-    [[ -f /tmp/na-fw-safety.pid ]] && { kill "$(cat /tmp/na-fw-safety.pid)" 2>/dev/null || true; rm -f /tmp/na-fw-safety.pid; }
+    [[ -f "$STATE_DIR/na-fw-safety.pid" ]] && { kill "$(cat "$STATE_DIR/na-fw-safety.pid")" 2>/dev/null || true; }
+    [[ -f /tmp/na-fw-safety.pid ]] && { kill "$(cat /tmp/na-fw-safety.pid)" 2>/dev/null || true; }
+    rm -f "$STATE_DIR/na-fw-safety.pid" "$STATE_DIR/na-fw-safety.log" /tmp/na-fw-safety.pid /tmp/na-fw-safety.log 2>/dev/null || true
 
     systemctl disable --now na-firewall.service >/dev/null 2>&1 || true
     rm -f /etc/systemd/system/na-firewall.service
