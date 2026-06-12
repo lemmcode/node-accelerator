@@ -15,7 +15,9 @@
 #   export NA_REF=v2.1; curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF/install.sh" | sudo -E bash -s all
 
 set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# ${BASH_SOURCE[0]:-$0}: при запуске через curl|bash (bash -s) BASH_SOURCE пуст, и под
+# set -u голый ${BASH_SOURCE[0]} даёт «unbound variable». Фоллбэк на $0 убирает шум.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 SCRIPTS="$SCRIPT_DIR/scripts"
 # NA_REF — ветка/тег для curl|bash-режима (по умолчанию main). Для прода пиньте тег.
 NA_REF="${NA_REF:-main}"
