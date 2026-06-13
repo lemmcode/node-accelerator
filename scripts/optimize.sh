@@ -27,6 +27,9 @@ trap 'tput cnorm 2>/dev/null || true; exit 130' INT
 require_root
 detect_os
 
+# Подхватываем сохранённый конфиг оптимизатора (ENV по-прежнему переопределяет).
+load_conf "$CONF_DIR/optimize.conf"
+
 # Подчищаем ТОЛЬКО XanMod-репозитории с мёртвыми suite (focal/jammy/releases выпилены
 # из репо) — их 404 роняет 'apt-get update' на повторном прогоне через set -e. Рабочий
 # list НЕ трогаем: иначе на уже настроенной ноде молча отключатся обновления ядра.
@@ -47,7 +50,8 @@ info "Бэкап изменяемых файлов: $BACKUP"
 # Прогресс-бар установки ядра (рисуется по APT::Status-Fd в install_xanmod).
 draw_progress_bar() {
     local percent=$1 desc=$2 width=30 i bar=""
-    local filled=$((percent * width / 100)) empty=$((width - filled))
+    local filled=$((percent * width / 100))
+    local empty=$((width - filled))
     for ((i=0; i<filled; i++)); do bar+="#"; done
     for ((i=0; i<empty;  i++)); do bar+="-"; done
     local maxlen=35
@@ -216,26 +220,48 @@ else
 fi
 
 # ─── 3. Sysctl ───────────────────────────────────────────────────────────────
-title "Sysctl: BBR, буферы, conntrack, anti-spoof, syncookies"
+title "Sysctl: BBR, буферы (tier-aware), conntrack, anti-spoof, syncookies"
+# Tier-aware буферы: масштабируем ПОТОЛКИ сокетов по RAM. На мелкой VPS 64MB-буфер на
+# сокет × сотни сокетов уводит ядро в OOM; на крупной — даём полный размер. Ёмкость
+# conntrack масштабируется отдельным drop-in ниже (тоже от RAM).
+_mem_kb="$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 1048576)"
+_mem_mb=$(( _mem_kb / 1024 ))
+if   [[ $_mem_mb -le 1200 ]]; then TIER=1; SOCK_MAX=16777216;  SOCK_DEF=524288
+elif [[ $_mem_mb -le 2500 ]]; then TIER=2; SOCK_MAX=33554432;  SOCK_DEF=1048576
+elif [[ $_mem_mb -le 8500 ]]; then TIER=3; SOCK_MAX=67108864;  SOCK_DEF=2097152
+else                               TIER=4; SOCK_MAX=134217728; SOCK_DEF=2097152
+fi
+# tcp_ecn: 2 (пассивный — принимаем ECN от клиента, но НЕ инициируем на исходящих)
+# безопаснее 1 на путях с битыми middlebox (исходящие коннекты ноды к апстримам).
+TCP_ECN_MODE="${TCP_ECN_MODE:-2}"; [[ "$TCP_ECN_MODE" =~ ^[012]$ ]] || TCP_ECN_MODE=2
+# TFO можно выключить (DISABLE_TFO=1): часть сетей режет SYN с TFO-payload.
+DISABLE_TFO="${DISABLE_TFO:-0}"; [[ "$DISABLE_TFO" =~ ^[01]$ ]] || DISABLE_TFO=0
+TFO_VAL=3; [[ "$DISABLE_TFO" == "1" ]] && TFO_VAL=0
+# overcommit: на tier1 (≤1.2G) heuristic (0) безопаснее агрессивного always-overcommit (1).
+OVERCOMMIT=1; [[ "$TIER" -le 1 ]] && OVERCOMMIT=0
+info "RAM-tier $TIER (~${_mem_mb} MB): sock_max=$SOCK_MAX def=$SOCK_DEF ecn=$TCP_ECN_MODE tfo=$TFO_VAL overcommit=$OVERCOMMIT"
 backup_file /etc/sysctl.d/99-node-accelerator.conf "$BACKUP"
-cat > /etc/sysctl.d/99-node-accelerator.conf <<'SYSCTL'
-# === node-accelerator / optimize ===
+cat > /etc/sysctl.d/99-node-accelerator.conf <<SYSCTL
+# === node-accelerator / optimize (RAM-tier $TIER, ~${_mem_mb} MB) ===
 
 # --- Network core ---
 net.core.default_qdisc            = fq
 net.core.netdev_max_backlog       = 250000
 net.core.somaxconn                = 65535
-net.core.rmem_default             = 2097152
-net.core.wmem_default             = 2097152
-net.core.rmem_max                 = 67108864
-net.core.wmem_max                 = 67108864
+net.core.rmem_default             = $SOCK_DEF
+net.core.wmem_default             = $SOCK_DEF
+net.core.rmem_max                 = $SOCK_MAX
+net.core.wmem_max                 = $SOCK_MAX
 net.core.optmem_max               = 65536
+# netdev_budget: сколько пакетов softirq дренирует за цикл (дефолт 300) — поднимаем под высокий PPS
+net.core.netdev_budget            = 600
+net.core.netdev_budget_usecs      = 8000
 # RPS: глобальная таблица flow-привязок (дополняет per-queue настройку из na-rps)
 net.core.rps_sock_flow_entries    = 32768
 
 # --- TCP (под XanMod congestion=bbr == BBRv3) ---
 net.ipv4.tcp_congestion_control   = bbr
-net.ipv4.tcp_fastopen             = 3
+net.ipv4.tcp_fastopen             = $TFO_VAL
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_tw_reuse             = 1
 net.ipv4.tcp_fin_timeout          = 15
@@ -257,10 +283,10 @@ net.ipv4.tcp_no_metrics_save      = 1
 net.ipv4.tcp_rfc1337              = 1
 net.ipv4.tcp_sack                 = 1
 net.ipv4.tcp_window_scaling       = 1
-net.ipv4.tcp_rmem                 = 4096 87380 67108864
-net.ipv4.tcp_wmem                 = 4096 65536 67108864
+net.ipv4.tcp_rmem                 = 4096 87380 $SOCK_MAX
+net.ipv4.tcp_wmem                 = 4096 65536 $SOCK_MAX
 net.ipv4.tcp_notsent_lowat        = 131072
-net.ipv4.tcp_ecn                  = 1
+net.ipv4.tcp_ecn                  = $TCP_ECN_MODE
 net.ipv4.ip_local_port_range      = 10000 65535
 
 # --- UDP (QUIC/Hysteria2/TUIC). Потолок буфера берётся из rmem_max выше. ---
@@ -303,7 +329,7 @@ net.ipv6.conf.all.accept_source_route      = 0
 vm.swappiness                = 10
 vm.dirty_ratio               = 10
 vm.dirty_background_ratio    = 5
-vm.overcommit_memory         = 1
+vm.overcommit_memory         = $OVERCOMMIT
 vm.max_map_count             = 262144
 
 # --- Файловые дескрипторы ---
@@ -441,9 +467,100 @@ else
     warn "Основной интерфейс не определён — NIC tuning пропущен"
 fi
 
+# ─── 6b. MSS clamp к PMTU (opt-in, для routed/WireGuard-VPN) ──────────────────
+# Для xray/VLESS форвард не задействован (proxy терминирует TCP), поэтому opt-in.
+# Дополняет, не заменяет tcp_min_snd_mss-пол выше (тот — для собственных сокетов ноды).
+title "MSS clamp (PMTU)"
+ENABLE_MSS_CLAMP="${ENABLE_MSS_CLAMP:-0}"
+if [[ "$ENABLE_MSS_CLAMP" == "1" ]]; then
+    apt_install nftables || warn "nftables не доустановился"
+    mkdir -p "$CONF_DIR"
+    cat > "$CONF_DIR/na_mss.nft" <<'EOF'
+#!/usr/sbin/nft -f
+# MSS clamp к PMTU на форварде — против PMTU-блэкхолов на туннелях (WireGuard/routed).
+# Своя таблица (НЕ flush ruleset). На прокси-нодах правило просто не матчится.
+table inet na_mss {
+    chain forward {
+        type filter hook forward priority mangle; policy accept;
+        tcp flags syn tcp option maxseg size set rt mtu
+    }
+}
+EOF
+    if nft -c -f "$CONF_DIR/na_mss.nft" 2>/dev/null; then
+        cat > /etc/systemd/system/na-mss-clamp.service <<EOF
+[Unit]
+Description=node-accelerator MSS clamp to PMTU (forward)
+After=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f $CONF_DIR/na_mss.nft
+ExecStop=/usr/sbin/nft delete table inet na_mss
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+        systemctl enable --now na-mss-clamp.service >/dev/null 2>&1 || true
+        ok "MSS clamp к PMTU включён (forward)"
+    else
+        warn "MSS-clamp ruleset не прошёл nft -c (нет nft/ядро?) — пропускаю"
+        rm -f "$CONF_DIR/na_mss.nft"
+    fi
+else
+    info "MSS clamp выкл (ENABLE_MSS_CLAMP=1 — для routed/WireGuard-нод)"
+fi
+
 # ─── 7. Swap ─────────────────────────────────────────────────────────────────
+# На мелких нодах (tier 1/2) zram-swap (компрессированный swap в RAM) лучше дискового:
+# меньше IO-просадок под анти-OOM. На крупных — обычный /swapfile. SETUP_NO_ZRAM=1 форсит swapfile.
 title "Swap"
-if [[ ! -f /swapfile ]] && ! swapon --show | grep -q .; then
+SETUP_NO_ZRAM="${SETUP_NO_ZRAM:-0}"
+if swapon --show 2>/dev/null | grep -q .; then
+    info "Swap уже есть — пропускаю"
+elif [[ "$TIER" -le 2 && "$SETUP_NO_ZRAM" != "1" ]] && modprobe zram 2>/dev/null; then
+    cat > /usr/local/sbin/na-zram-setup <<'ZR'
+#!/usr/bin/env bash
+# zram-swap ~50% RAM (lz4). Идемпотентно: если наш zram-swap уже активен — выходим.
+set -e
+modprobe zram 2>/dev/null || exit 0
+swapon --show=NAME --noheadings 2>/dev/null | grep -q '/dev/zram' && exit 0
+SIZE="$(awk '/^MemTotal:/{printf "%d", $2*1024/2}' /proc/meminfo 2>/dev/null)"
+[ -n "$SIZE" ] || exit 0
+DEV="$(zramctl --find --size "$SIZE" --algorithm lz4 2>/dev/null || zramctl --find --size "$SIZE" 2>/dev/null || true)"
+[ -n "$DEV" ] || exit 0
+mkswap "$DEV" >/dev/null 2>&1 || exit 0
+swapon -p 100 "$DEV" 2>/dev/null || true
+echo "na-zram: $DEV size=$SIZE"
+ZR
+    chmod +x /usr/local/sbin/na-zram-setup
+    cat > /etc/systemd/system/na-zram.service <<'EOF'
+[Unit]
+Description=node-accelerator zram-swap
+After=local-fs.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/na-zram-setup
+ExecStop=/bin/sh -c 'for d in $(swapon --show=NAME --noheadings 2>/dev/null | grep /dev/zram); do swapoff "$d" 2>/dev/null || true; done'
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now na-zram.service >/dev/null 2>&1 || true
+    if swapon --show 2>/dev/null | grep -q zram; then
+        ok "zram-swap включён ($(swapon --show=NAME,SIZE --noheadings 2>/dev/null | grep zram | tr '\n' ' '))"
+    else
+        warn "zram не поднялся — fallback на /swapfile"
+        SWAP_SIZE="${REMNAWAVE_SWAP_SIZE:-2G}"
+        fallocate -l "$SWAP_SIZE" /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none
+        chmod 600 /swapfile; mkswap /swapfile >/dev/null; swapon /swapfile
+        grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+        ok "Создан /swapfile $SWAP_SIZE"
+    fi
+else
     SWAP_SIZE="${REMNAWAVE_SWAP_SIZE:-2G}"
     fallocate -l "$SWAP_SIZE" /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none
     chmod 600 /swapfile
@@ -451,8 +568,6 @@ if [[ ! -f /swapfile ]] && ! swapon --show | grep -q .; then
     swapon /swapfile
     grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
     ok "Создан /swapfile $SWAP_SIZE"
-else
-    info "Swap уже есть — пропускаю"
 fi
 
 # ─── 8. journald cap ─────────────────────────────────────────────────────────
@@ -524,6 +639,11 @@ nic=${NIC:-none}
 xanmod=$([[ -f "$STATE_DIR/xanmod.pkg" ]] && cat "$STATE_DIR/xanmod.pkg" || echo none)
 reboot_needed=$REBOOT_NEEDED
 EOF
+
+# Персист конфига оптимизатора → ре-ран без ENV не сбрасывает выбор сборки/флейвора.
+save_conf "$CONF_DIR/optimize.conf" \
+    ENABLE_XANMOD XANMOD_FLAVOR REMNAWAVE_SWAP_SIZE \
+    DISABLE_TFO TCP_ECN_MODE ENABLE_MSS_CLAMP SETUP_NO_ZRAM
 
 title "ГОТОВО"
 ok "Оптимизатор применён."
