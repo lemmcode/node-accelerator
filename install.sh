@@ -25,12 +25,36 @@ NA_REF="${NA_REF:-main}"
 [[ "$NA_REF" =~ ^[A-Za-z0-9._/-]+$ && "$NA_REF" != *..* ]] || { echo "[x] NA_REF '$NA_REF' невалиден"; exit 1; }
 REPO_URL="${NA_REPO_URL:-https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF}"
 
+# Опц. проверка подписи модулей в curl|bash-режиме (supply-chain hardening). По умолч.
+# выкл. NA_REQUIRE_SIG=1 + minisign-ключ (NA_MINISIGN_PUBKEY) ИЛИ GPG-отпечаток
+# (NA_SIG_FINGERPRINT) → каждый модуль проверяется против .minisig/.asc рядом в репо.
+NA_REQUIRE_SIG="${NA_REQUIRE_SIG:-0}"
+NA_MINISIGN_PUBKEY="${NA_MINISIGN_PUBKEY:-}"
+NA_SIG_FINGERPRINT="${NA_SIG_FINGERPRINT:-}"
+verify_sig() {  # verify_sig <файл> <url-без-расширения>
+    local file="$1" url="$2"
+    if [[ -n "$NA_MINISIGN_PUBKEY" ]] && command -v minisign >/dev/null 2>&1; then
+        curl -fsSL "$url.minisig" -o "$file.minisig" 2>/dev/null || { echo "[x] нет .minisig для $(basename "$file")"; return 1; }
+        minisign -V -P "$NA_MINISIGN_PUBKEY" -m "$file" >/dev/null 2>&1
+    elif [[ -n "$NA_SIG_FINGERPRINT" ]] && command -v gpg >/dev/null 2>&1; then
+        curl -fsSL "$url.asc" -o "$file.asc" 2>/dev/null || { echo "[x] нет .asc для $(basename "$file")"; return 1; }
+        gpg --verify "$file.asc" "$file" 2>&1 | grep -q "${NA_SIG_FINGERPRINT// /}"
+    else
+        echo "[x] NA_REQUIRE_SIG=1, но нет minisign+NA_MINISIGN_PUBKEY или gpg+NA_SIG_FINGERPRINT"; return 1
+    fi
+}
+
 # curl|bash — подтянуть модули
 if [[ ! -d "$SCRIPTS" ]]; then
     SCRIPTS="$(mktemp -d)/scripts"; mkdir -p "$SCRIPTS/lib"
     echo "[*] Скачиваю модули из $REPO_URL ..."
     for f in lib/common.sh optimize.sh protect.sh diagnose.sh rollback.sh; do
         curl -fsSL "$REPO_URL/scripts/$f" -o "$SCRIPTS/$f" || { echo "[x] Не скачал $f"; exit 1; }
+        if [[ "$NA_REQUIRE_SIG" == "1" ]]; then
+            verify_sig "$SCRIPTS/$f" "$REPO_URL/scripts/$f" \
+                && echo "[+] подпись $f валидна" \
+                || { echo "[x] подпись $f НЕ прошла — отказ (NA_REQUIRE_SIG=1)"; exit 1; }
+        fi
     done
 fi
 
@@ -41,7 +65,7 @@ detect_os
 
 run_optimize() { bash "$SCRIPTS/optimize.sh"; }
 run_protect()  { bash "$SCRIPTS/protect.sh"; }
-run_diagnose() { bash "$SCRIPTS/diagnose.sh"; }
+run_diagnose() { bash "$SCRIPTS/diagnose.sh" "$@"; }
 run_rollback() { bash "$SCRIPTS/rollback.sh" "${1:-all}"; }
 
 show_menu() {
@@ -89,7 +113,7 @@ BANNER
 case "${1:-}" in
     optimize) run_optimize ;;
     protect)  run_protect ;;
-    diagnose|diag) run_diagnose ;;
+    diagnose|diag) shift; run_diagnose "$@" ;;
     all)      run_optimize; run_protect; run_diagnose ;;
     rollback) run_rollback "${2:-all}" ;;
     "")       show_menu ;;

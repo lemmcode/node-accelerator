@@ -23,11 +23,14 @@ rollback_optimize() {
     rm -f /etc/systemd/journald.conf.d/na-size.conf
     sed -i '/# === node-accelerator ===/,/# === \/node-accelerator ===/d' /etc/security/limits.conf 2>/dev/null || true
 
-    for svc in na-rps na-nic-tune na-cpu-perf na-thp-off; do
+    for svc in na-rps na-nic-tune na-cpu-perf na-thp-off na-zram na-mss-clamp; do
         systemctl disable --now "$svc.service" >/dev/null 2>&1 || true
         rm -f "/etc/systemd/system/$svc.service"
     done
-    rm -f /usr/local/sbin/na-rps-setup
+    rm -f /usr/local/sbin/na-rps-setup /usr/local/sbin/na-zram-setup
+    # MSS-clamp: снять свою таблицу
+    nft delete table inet na_mss 2>/dev/null || true
+    rm -f "$CONF_DIR/na_mss.nft"
 
     systemctl daemon-reload
     sysctl --system >/dev/null 2>&1 || true
@@ -48,7 +51,7 @@ rollback_optimize() {
             warn "Чтобы убрать: загрузись со стокового ядра и запусти NA_REMOVE_XANMOD=1 rollback optimize."
         fi
     fi
-    rm -f "$STATE_DIR/optimize.installed"
+    rm -f "$STATE_DIR/optimize.installed" "$CONF_DIR/optimize.conf"
     ok "optimize откатан (значения sysctl вернутся к дефолтам; XanMod — по флагу)"
 }
 
@@ -59,16 +62,25 @@ rollback_protect() {
     [[ -f /tmp/na-fw-safety.pid ]] && { kill "$(cat /tmp/na-fw-safety.pid)" 2>/dev/null || true; }
     rm -f "$STATE_DIR/na-fw-safety.pid" "$STATE_DIR/na-fw-safety.log" /tmp/na-fw-safety.pid /tmp/na-fw-safety.log 2>/dev/null || true
 
-    systemctl disable --now na-firewall.service >/dev/null 2>&1 || true
-    rm -f /etc/systemd/system/na-firewall.service
+    # v3.0 модули: fleet-sync / blocklists / ctguard — снимаем таймеры/сервисы
+    for unit in na-firewall na-fleet-sync na-blocklist na-ctguard; do
+        systemctl disable --now "$unit.service" >/dev/null 2>&1 || true
+        systemctl disable --now "$unit.timer"   >/dev/null 2>&1 || true
+        rm -f "/etc/systemd/system/$unit.service" "/etc/systemd/system/$unit.timer"
+    done
     systemctl daemon-reload
 
-    # удаляем ТОЛЬКО свою таблицу — CrowdSec/Docker не трогаем
-    nft delete table inet na_filter 2>/dev/null || true
+    # удаляем ТОЛЬКО свои таблицы — CrowdSec/Docker не трогаем
+    nft delete table inet na_filter  2>/dev/null || true
+    nft delete table inet na_ctguard 2>/dev/null || true
     rm -f "$CONF_DIR/na_filter.nft"
-    rm -f /usr/local/sbin/na-fw-status /usr/local/sbin/na-fw-top-talkers
-    rm -f "$STATE_DIR/protect.installed"
-    ok "na_filter удалена, сервис снят"
+    rm -f /usr/local/sbin/na-fw-status /usr/local/sbin/na-fw-top-talkers \
+          /usr/local/sbin/na-fleet-sync /usr/local/sbin/na-blocklist-update /usr/local/sbin/na-ctguard
+    rm -f /etc/modules-load.d/na-synproxy.conf "$STATE_DIR/.synproxy-degraded"
+    # конфиги: persisted protect.conf, ctguard.conf, токен панели fleet.env (custom-blocklist.txt — данные оператора, оставляем)
+    rm -f "$STATE_DIR/protect.installed" "$CONF_DIR/protect.conf" "$CONF_DIR/ctguard.conf" "$CONF_DIR/fleet.env"
+    [[ -f "$CONF_DIR/custom-blocklist.txt" ]] && info "оставлен $CONF_DIR/custom-blocklist.txt (данные оператора)"
+    ok "na_filter/na_ctguard удалены, сервисы и таймеры сняты"
 
     if [[ "${NA_PURGE_CROWDSEC:-0}" == "1" ]]; then
         warn "Удаляю CrowdSec и bouncer..."
