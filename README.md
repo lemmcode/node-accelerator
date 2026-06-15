@@ -48,7 +48,10 @@
 - **Персист конфига** — ре-ран без ENV не сбрасывает поднятые под ноду ручки.
 
 ### 🩺 Диагностика (`scripts/diagnose.sh`)
-Read-only отчёт: ядро/BBR, sysctl, лимиты, conntrack, NIC/RPS, swap/THP/governor, firewall, CrowdSec, порты, RTT — с итогом ✔/▲/✘ и рекомендациями.
+Read-only отчёт: ядро/BBR, sysctl, лимиты, conntrack, NIC/RPS, swap/THP/governor, firewall, CrowdSec, порты, RTT — с итогом ✔/▲/✘ и рекомендациями. После установки доступна как команда **`na-diagnose`** (в т.ч. `na-diagnose --json` для мониторинга/панели).
+
+### 🔥 Форензика атак (`scripts/na-report.sh`)
+Read-only: кто/откуда/чем/когда — из журнала ядра, nft-сетов и CrowdSec. **`na-report`** (человекочитаемо) или **`na-report --json`**: `drops_by_reason`, `timeline`, `top_ips` с вердиктом, `top_asn` (ASN/гео — best-effort через Team Cymru whois). Флаги: `--hours N`, `--top N`, `--ip <addr>`.
 
 ---
 
@@ -128,10 +131,12 @@ curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF
 ```bash
 na-fw-status                 # баны, suspect, blocklist, fleet, ctguard, synproxy, CrowdSec
 na-fw-top-talkers            # топ источников по сервисным портам
+na-diagnose                  # 🩺 health-отчёт (read-only)
+na-diagnose --json           # JSON для флот-мониторинга (Zabbix/Prometheus/панель)
+na-report                    # 🔥 форензика атак за 24ч (кто/откуда/чем/когда)
+na-report --json             # JSON форензики; --hours N, --top N, --ip <addr>
 nft list table inet na_filter
 cscli decisions list
-sudo bash scripts/diagnose.sh           # человекочитаемый отчёт
-sudo bash scripts/diagnose.sh --json    # JSON для флот-мониторинга (Zabbix/Prometheus)
 journalctl -t na-fleet-sync -t na-blocklist -t na-ctguard   # логи модулей
 ```
 

@@ -1,5 +1,32 @@
 # Changelog
 
+## v3.1 — 2026-06-15
+
+Наблюдаемость: нода теперь отдаёт стабильный машинный интерфейс для внешнего
+мониторинга/панели. Поведение защиты/тюнинга не меняется. Концепция форензик-слоя
+вдохновлена наработками коллеги-оператора (по его просьбе — без имени).
+
+### 🩺 Постоянная CLI (na-diagnose / na-report)
+- **`na-diagnose`** — после `optimize`/`protect`/`all` на ноде остаётся read-only
+  команда (обёртка в `/usr/local/sbin`, скрипты в `/usr/local/lib/node-accelerator`).
+  Раньше при `curl|bash` модули жили в temp и постоянной команды диагностики не
+  оставалось — панелям/Zabbix/SSH-поллингу нужен стабильный `na-diagnose --json`.
+  Новый сабкоманд `install.sh persist` — (пере)создать CLI без полного прогона.
+  `DRY_RUN=1` ничего не пишет; `rollback` снимает CLI, когда не осталось модулей.
+
+### 🔥 na-report — форензика атак (read-only)
+- **`na-report` / `na-report --json`** — кто/откуда/чем/когда, из данных, которые уже
+  есть на ноде: журнал ядра (`[na portscan|synflood|ssh-flood|badflags]`), nft-сеты
+  (`autoban`/`suspect`/`blocklist`), решения CrowdSec. Выдаёт: `events_total`,
+  `ban_rate_5m`, `drops_by_reason`, `timeline[12]` (последний час), `top_ips`
+  (с вердиктом attacker/suspect + confidence) и `top_asn`. ASN/гео — best-effort через
+  Team Cymru whois (нет `whois`/сети → поле пустое, остальное работает). `--hours N`,
+  `--top N`, `--ip <addr>` (вердикт по одному IP).
+
+### ✅ CI
+- smoke-матрица теперь прогоняет `install.sh persist` (na-diagnose создаётся и отдаёт
+  JSON), проверяет `DRY_RUN` без эффектов и снятие CLI на `rollback`.
+
 ## v3.0 — 2026-06-13
 
 Крупный релиз: персист-конфиг, fleet auto-sync, новый класс DDoS-защиты
