@@ -3,8 +3,9 @@
 # diagnose.sh — 🩺 Диагностика ноды (read-only, ничего не меняет).
 # Проверяет ядро/BBR, sysctl, лимиты, conntrack, MSS-коллапс, NIC/RPS, firewall,
 # blocklists/fleet/ctguard, CrowdSec — печатает итог ✔/▲/✘ с рекомендациями.
-#   diagnose.sh           — человекочитаемый отчёт
-#   diagnose.sh --json    — один JSON-объект для флот-мониторинга (Zabbix/Prometheus)
+#   diagnose.sh             — человекочитаемый отчёт
+#   diagnose.sh --json      — один JSON-объект для флот-мониторинга (Zabbix/Prometheus)
+#   diagnose.sh --retrans [--window N]  — глубокий разбор причин TCP-retransmits
 
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -78,6 +79,126 @@ emit_json() {
     printf '"safety_armed":%s,"reboot_needed":%s}\n' "$safety" "$rebootn"
 }
 if [[ "${1:-}" == "--json" ]]; then emit_json; exit 0; fi
+
+# ─── Глубокий разбор retrans (`--retrans [--window N]`) ───────────────────────
+# Панель/`--json` показывают tcp_retrans_pct и mss_collapsed — это инструмент
+# «докопаться до причины»: TX vs RX, тип retrans, хвост сокетов, CC на проводе,
+# дропы qdisc/ring/softirq, accept-queue, TCP-фичи + вердикт. Read-only. Все дельты
+# снимаются за ОДНО окно (а не цепочкой sleep'ов).
+_snmp()    { awk -v k="$1" '/^Tcp:/{if(!h){for(i=2;i<=NF;i++)n[i]=$i;h=1;next} for(i=2;i<=NF;i++) if(n[i]==k) print $i}' /proc/net/snmp 2>/dev/null; }
+_tcpext()  { awk -v k="$1" '/^TcpExt:/{if(!h){for(i=2;i<=NF;i++)n[i]=$i;h=1;next} for(i=2;i<=NF;i++) if(n[i]==k) print $i}' /proc/net/netstat 2>/dev/null; }
+_tcq()     { tc -s qdisc show dev "$1" 2>/dev/null | grep -oE "$2 [0-9]+" | head -1 | awk '{print $2+0}'; }
+_softirq() { awk -v k="$1" '$1==k":"{s=0;for(i=2;i<=NF;i++)s+=$i;print s}' /proc/softirqs 2>/dev/null; }
+
+retrans_deep() {
+    local win=20 IFACE k v d
+    [[ "${1:-}" == "--window" && -n "${2:-}" ]] && win="$2"
+    [[ "$win" =~ ^[0-9]+$ && "$win" -ge 5 && "$win" -le 300 ]] || win=20
+    IFACE="$(default_iface)"; IFACE="${IFACE:-eth0}"
+
+    clear 2>/dev/null || true
+    printf "%b" "$BOLD"
+    cat <<'B'
+  ┌────────────────────────────────────────────┐
+  │   🔬  node-accelerator — разбор retrans     │
+  └────────────────────────────────────────────┘
+B
+    printf "%b" "$NC"
+    info "iface=$IFACE   окно семплинга=${win}s   (read-only)"
+
+    # ── BEFORE
+    local out0 rtx0 in0; out0="$(_snmp OutSegs)"; rtx0="$(_snmp RetransSegs)"; in0="$(_snmp InSegs)"
+    local exts="TCPLostRetransmit TCPSlowStartRetrans TCPSynRetrans TCPTimeouts TCPSackRecovery TCPSpuriousRtxHostQueues TCPBacklogDrop TCPRcvQDrop"
+    declare -A E0
+    for k in $exts; do v="$(_tcpext "$k")"; E0[$k]="${v:-0}"; done
+    local qd0 qo0 qr0 rx0 tx0 eth0f=""
+    qd0="$(_tcq "$IFACE" dropped)"; qo0="$(_tcq "$IFACE" overlimits)"; qr0="$(_tcq "$IFACE" requeues)"
+    rx0="$(_softirq NET_RX)"; tx0="$(_softirq NET_TX)"
+    command -v ethtool >/dev/null 2>&1 && { eth0f="$(mktemp)"; ethtool -S "$IFACE" 2>/dev/null > "$eth0f"; }
+
+    sleep "$win"
+
+    # ── AFTER + дельты
+    local out1 rtx1 in1 dout drtx din rate ratio
+    out1="$(_snmp OutSegs)"; rtx1="$(_snmp RetransSegs)"; in1="$(_snmp InSegs)"
+    dout=$(( ${out1:-0} - ${out0:-0} )); drtx=$(( ${rtx1:-0} - ${rtx0:-0} )); din=$(( ${in1:-0} - ${in0:-0} ))
+
+    title "1) Retrans rate (за ${win}s)"
+    if [[ "$dout" -gt 0 ]]; then
+        rate="$(awk -v r="$drtx" -v o="$dout" 'BEGIN{printf "%.2f", r*100/o}')"
+        status_line "$(awk -v x="$rate" 'BEGIN{print (x>=5?"FAIL":(x>=2?"WARN":"OK"))}')" "retrans = ${rate}%   (Retrans Δ=$drtx / OutSegs Δ=$dout)"
+    else
+        info "трафика за окно почти не было (OutSegs Δ=$dout) — увеличь --window"
+    fi
+    ratio="$(awk -v i="$din" -v o="$dout" 'BEGIN{if(i>0)printf "%.2f",o/i; else print "?"}')"
+    info "InSegs Δ=$din  OutSegs Δ=$dout  out/in=$ratio   (>>1 = download через ноду; <1 = upload)"
+
+    title "2) Тип retrans (Δ за ${win}s — что доминирует)"
+    for k in $exts; do
+        v="$(_tcpext "$k")"; v="${v:-0}"; d=$(( v - ${E0[$k]:-0} ))
+        [[ "$d" -gt 0 ]] && printf "   %-28s +%d\n" "$k" "$d"
+    done
+    cat <<'I'
+   ─ SackRecovery/SlowStartRetrans = реальные потери (SACK/dup-ACK)
+   ─ Timeouts = RTO/stall (тяжёлые потери или залипание пути/таргета)
+   ─ LostRetransmit = ретрансмит сам потерялся → плохой путь
+   ─ SpuriousRtxHostQueues = буферизация в host-очередях (qdisc/ring)
+   ─ BacklogDrop = переполнение accept-queue (приложение не успевает)
+I
+
+    title "3) Хвост по сокетам (top retrans)"
+    if command -v ss >/dev/null 2>&1; then
+        ss -tin state established 2>/dev/null \
+          | awk '/retrans:/{ if(match($0,/retrans:[0-9]+\/[0-9]+/)){ s=substr($0,RSTART,RLENGTH); split(s,p,"/"); if(p[2]+0>0) print p[2] } }' \
+          | sort -rn | head -8 | awk '{printf "   retrans=%s\n",$1}'
+        ss -tin state established 2>/dev/null | grep -oE 'retrans:[0-9]+/[0-9]+' | awk -F/ '{print $2}' \
+          | awk '{t++; if($1==0)b["0"]++; else if($1<5)b["1-4"]++; else if($1<20)b["5-19"]++; else if($1<100)b["20-99"]++; else b["100+"]++}
+                 END{ if(t){printf "   распределение по %d сокетам → ",t; for(x in b) printf "%s:%d  ",x,b[x]; print ""} }'
+    else warn "ss недоступен"; fi
+
+    title "4) Congestion control на проводе"
+    info "настройка: cc=$(val net.ipv4.tcp_congestion_control)  qdisc=$(val net.core.default_qdisc)"
+    if command -v ss >/dev/null 2>&1; then
+        local ccdist; ccdist="$(ss -tin state established 2>/dev/null | grep -oE ' (bbr|cubic|reno|htcp|vegas|dctcp) ' | sort | uniq -c | sort -rn | awk '{printf "%s:%s  ",$2,$1}')"
+        [[ -n "$ccdist" ]] && info "на сокетах: $ccdist" || info "на сокетах: (нет ESTAB или старый ss)"
+        if ss -tin state established 2>/dev/null | grep -qE ' cubic ' && [[ "$(val net.ipv4.tcp_congestion_control)" == "bbr" ]]; then
+            warn "часть сокетов на cubic при cc=bbr — это коннекты ДО смены CC (или приложение задаёт своё)"
+        fi
+    fi
+
+    title "5) Дропы TX-тракта (Δ за ${win}s)"
+    local qd1 qo1 qr1 rx1 tx1
+    qd1="$(_tcq "$IFACE" dropped)"; qo1="$(_tcq "$IFACE" overlimits)"; qr1="$(_tcq "$IFACE" requeues)"
+    printf "   qdisc: dropped +%s  overlimits +%s  requeues +%s\n" "$(( ${qd1:-0}-${qd0:-0} ))" "$(( ${qo1:-0}-${qo0:-0} ))" "$(( ${qr1:-0}-${qr0:-0} ))"
+    rx1="$(_softirq NET_RX)"; tx1="$(_softirq NET_TX)"
+    printf "   softirq: NET_RX +%s  NET_TX +%s\n" "$(( ${rx1:-0}-${rx0:-0} ))" "$(( ${tx1:-0}-${tx0:-0} ))"
+    if [[ -n "$eth0f" ]]; then
+        local eth1f; eth1f="$(mktemp)"; ethtool -S "$IFACE" 2>/dev/null > "$eth1f"
+        awk 'NR==FNR{a[$1]=$2;next}{if($2+0>a[$1]+0 && (($1) in a)) printf "   nic: %-30s +%d\n",$1,$2-a[$1]}' "$eth0f" "$eth1f" \
+          | grep -iE 'drop|err|miss|fifo|nobuf|over' | head -8
+        rm -f "$eth0f" "$eth1f"
+    fi
+
+    title "6) Очереди и TCP-фичи"
+    if command -v ss >/dev/null 2>&1; then
+        info "состояния: $(ss -tan 2>/dev/null | awk 'NR>1{c[$1]++}END{for(s in c)printf "%s:%d ",s,c[s]}')"
+        local lq; lq="$(ss -tlnH 2>/dev/null | awk '$2+0>0{print $4"(rq="$2")"}' | head -5 | tr '\n' ' ')"
+        [[ -n "$lq" ]] && warn "listen-очереди с backlog: $lq" || info "listen-очереди: пусто (accept успевает)"
+    fi
+    info "sack=$(val net.ipv4.tcp_sack) dsack=$(val net.ipv4.tcp_dsack) ts=$(val net.ipv4.tcp_timestamps) frto=$(val net.ipv4.tcp_frto) recovery=$(val net.ipv4.tcp_recovery)"
+    local msnd mtup collapsed
+    msnd="$(val net.ipv4.tcp_min_snd_mss)"; mtup="$(val net.ipv4.tcp_mtu_probing)"
+    collapsed="$(ss -tin 2>/dev/null | grep -oE 'mss:[0-9]+' | awk -F: '$2>0 && $2<256{c++}END{print c+0}')"
+    info "min_snd_mss=${msnd:-?} mtu_probing=${mtup:-?} collapsed_sockets=${collapsed:-0}"
+
+    title "Вердикт"
+    local said=0
+    [[ "$(( ${qd1:-0}-${qd0:-0} ))" -gt 0 ]] && { warn "qdisc дропает на TX — переполнение исходящей очереди (burst/линия медленнее ядра)"; said=1; }
+    [[ "${collapsed:-0}" -gt 0 && "${msnd:-0}" -le 64 ]] && { warn "MSS-коллапс: min_snd_mss=${msnd:-?} + collapsed=${collapsed} → send-MSS схлопывается на лоссовом плече (mtu_probing=${mtup:-?}); floor 512 + mtu_probing=0 лечит"; said=1; }
+    [[ "$said" -eq 0 ]] && ok "явных TX-узких мест за окно не видно — смотри тип retrans выше (Timeouts=путь/таргет, SackRecovery=потери к клиенту)"
+    echo
+}
+if [[ "${1:-}" == "--retrans" ]]; then shift; retrans_deep "$@"; exit 0; fi
 
 clear 2>/dev/null || true
 printf "%b" "$BOLD"

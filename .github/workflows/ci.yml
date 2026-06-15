@@ -72,6 +72,8 @@ jobs:
         run: bash scripts/diagnose.sh || true
       - name: diagnose.sh --json (machine-readable smoke)
         run: bash scripts/diagnose.sh --json || true
+      - name: diagnose.sh --retrans (deep-dive smoke, короткое окно)
+        run: bash scripts/diagnose.sh --retrans --window 5 || true
       - name: install.sh persist → CLI na-diagnose создаётся и отдаёт JSON
         run: |
           bash install.sh persist

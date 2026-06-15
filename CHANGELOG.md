@@ -1,5 +1,18 @@
 # Changelog
 
+## v3.2 — 2026-06-15
+
+Диагностика **причин** TCP-retransmits (read-only, поведение не меняется).
+
+### 🔬 `na-diagnose --retrans [--window N]`
+Докапывается до причины retrans, а не только до факта. За одно окно семплинга
+(по умолч. 20с): retrans-rate, TX/RX-перекос (download vs upload), разбивка по
+**типу** (Timeouts/LostRetransmit/SackRecovery/SlowStart/BacklogDrop), хвост сокетов
+с retrans + распределение, реальный congestion-control **на проводе** (bbr vs cubic),
+дропы TX-тракта (qdisc/softirq/NIC ring), accept-queue, TCP-фичи (sack/dsack/frto/
+recovery/`min_snd_mss`/`mtu_probing`) — и **вердикт** (MSS-коллапс / qdisc-overflow /
+путь). Концепция вдохновлена наработками коллеги-оператора (по его просьбе — без имени).
+
 ## v3.1 — 2026-06-15
 
 Наблюдаемость: нода теперь отдаёт стабильный машинный интерфейс для внешнего

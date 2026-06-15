@@ -48,7 +48,7 @@
 - **Персист конфига** — ре-ран без ENV не сбрасывает поднятые под ноду ручки.
 
 ### 🩺 Диагностика (`scripts/diagnose.sh`)
-Read-only отчёт: ядро/BBR, sysctl, лимиты, conntrack, NIC/RPS, swap/THP/governor, firewall, CrowdSec, порты, RTT — с итогом ✔/▲/✘ и рекомендациями. После установки доступна как команда **`na-diagnose`** (в т.ч. `na-diagnose --json` для мониторинга/панели).
+Read-only отчёт: ядро/BBR, sysctl, лимиты, conntrack, NIC/RPS, swap/THP/governor, firewall, CrowdSec, порты, RTT — с итогом ✔/▲/✘ и рекомендациями. После установки доступна как команда **`na-diagnose`** (`--json` для мониторинга/панели; `--retrans [--window N]` — разбор причин TCP-retransmits).
 
 ### 🔥 Форензика атак (`scripts/na-report.sh`)
 Read-only: кто/откуда/чем/когда — из журнала ядра, nft-сетов и CrowdSec. **`na-report`** (человекочитаемо) или **`na-report --json`**: `drops_by_reason`, `timeline`, `top_ips` с вердиктом, `top_asn` (ASN/гео — best-effort через Team Cymru whois). Флаги: `--hours N`, `--top N`, `--ip <addr>`.
@@ -133,6 +133,7 @@ na-fw-status                 # баны, suspect, blocklist, fleet, ctguard, syn
 na-fw-top-talkers            # топ источников по сервисным портам
 na-diagnose                  # 🩺 health-отчёт (read-only)
 na-diagnose --json           # JSON для флот-мониторинга (Zabbix/Prometheus/панель)
+na-diagnose --retrans        # 🔬 разбор ПРИЧИН TCP-retransmits (TX/RX, тип, хвост, CC, дропы)
 na-report                    # 🔥 форензика атак за 24ч (кто/откуда/чем/когда)
 na-report --json             # JSON форензики; --hours N, --top N, --ip <addr>
 nft list table inet na_filter
