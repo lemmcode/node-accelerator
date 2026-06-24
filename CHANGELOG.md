@@ -1,5 +1,16 @@
 # Changelog
 
+## v3.4 — 2026-06-24
+
+Self-audit на residential-proxy / proxyware-SDK (read-only) — доказательная база для ответа на abuse-тикеты хостеров.
+
+### 🕵 na-report — новый режим `--proxyware`
+- проверка сигнатур известного proxyware (IPIDEA/PacketSDK/Honeygain/EarnApp/Peer2Profit/…) в процессах, systemd-юнитах, cron, файлах и docker-образах;
+- поиск **установленных** соединений к C2-инфраструктуре proxyware (резолв доменов → match по ESTABLISHED peer-адресам);
+- список внешне-доступных listener'ов (контекст для оператора);
+- вердикт `clean|suspect`; `--proxyware --json` — один объект для панели/флота.
+- Сигнатуры — только конкретные имена продуктов (generic «proxy» не матчим, чтобы не ловить сам xray/VLESS).
+
 ## v3.3.1 — 2026-06-16
 
 ### 🐞 Фикс
