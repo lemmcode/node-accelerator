@@ -14,9 +14,9 @@
 # ENV (всё опционально):
 #   SSH_PORT, TCP_PORTS=443,2087, UDP_PORTS=443,2087, NODE_PORT=2222
 #   WHITELIST="1.2.3.4,5.6.7.0/24"     IP/CIDR панели/мониторинга (v4 и v6)
-#   SYN_RATE=100  SYN_BURST=200        per-IP лимит новых TCP-конн./сек на сервисный порт
+#   SYN_RATE=200  SYN_BURST=400        per-IP лимит новых TCP-конн./сек на сервисный порт
 #   UDP_RATE=200  UDP_BURST=400        per-IP лимит UDP пакетов/сек
-#   CONN_LIMIT=600                     макс. одновременных конн. с одного IP (ct count)
+#   CONN_LIMIT=2048                    макс. одновременных конн. с одного IP (ct count)
 #   SSH_RATE=6    SSH_BURST=5          per-IP новых SSH/мин до бана
 #   SSH_BAN_TIME=24h  PORTSCAN_BAN_TIME=1h
 #   ENABLE_PORTSCAN_BAN=1  ENABLE_CROWDSEC=1  ENABLE_SYNPROXY=0
@@ -76,9 +76,14 @@ ENABLE_BLOCKLISTS="${ENABLE_BLOCKLISTS:-0}"
 BLOCK_TOR="${BLOCK_TOR:-0}"
 BLOCKLIST_REFRESH="${BLOCKLIST_REFRESH:-12h}"
 # Remnawave fleet auto-sync: ноды флота сами держат IP друг друга в whitelist.
-# 'auto' = вкл при заданных REMNAWAVE_URL+TOKEN; 1=форс; 0=выкл.
+# 'auto' = вкл при заданных REMNAWAVE_URL+TOKEN (или REMNAWAVE_NODES_URL); 1=форс; 0=выкл.
+# REMNAWAVE_NODES_URL — альтернатива БЕЗ токена панели на ноде: статический JSON того же
+# вида, что /api/nodes (панель публикует кроном, доступ ограничить basic-auth/allowlist),
+# либо plain-text: адрес/hostname на строку, # — комментарий. Снимает blast-radius
+# полноценного API-токена, лежащего на каждой ноде.
 REMNAWAVE_URL="${REMNAWAVE_URL:-}"
 REMNAWAVE_TOKEN="${REMNAWAVE_TOKEN:-}"
+REMNAWAVE_NODES_URL="${REMNAWAVE_NODES_URL:-}"
 FLEET_SYNC="${FLEET_SYNC:-auto}"
 FLEET_SYNC_INTERVAL="${FLEET_SYNC_INTERVAL:-5min}"
 # conntrack phantom-eviction (защита от distributed connect-and-hold) — opt-in,
@@ -142,6 +147,9 @@ done
 if [[ -n "$REMNAWAVE_URL" && ! "$REMNAWAVE_URL" =~ ^https?://[A-Za-z0-9._~:/?#=%@-]+$ ]]; then
     err "REMNAWAVE_URL='$REMNAWAVE_URL' — ожидается http(s)://… без спецсимволов"; exit 1
 fi
+if [[ -n "$REMNAWAVE_NODES_URL" && ! "$REMNAWAVE_NODES_URL" =~ ^https?://[A-Za-z0-9._~:/?#=%@-]+$ ]]; then
+    err "REMNAWAVE_NODES_URL='$REMNAWAVE_NODES_URL' — ожидается http(s)://… без спецсимволов"; exit 1
+fi
 unset _k
 
 # Резолв NODE_PORT_WHITELIST_ONLY=auto: whitelist-only только если оператор задал
@@ -174,8 +182,59 @@ fi
 
 # ─── Зависимости ─────────────────────────────────────────────────────────────
 title "Зависимости"
-apt_install nftables curl ca-certificates iproute2
+apt_install nftables curl ca-certificates iproute2 gnupg
 ok "ok"
+
+# ─── CrowdSec: пиннингованный APT-репозиторий (supply-chain) ─────────────────
+# Вместо curl|bash с install.crowdsec.net — их packagecloud-репо с проверкой ПОЛНОГО
+# отпечатка ключа (64-битный keyid подделать дёшево). Suite нет для этой ОС (свежие
+# релизы Ubuntu/Debian) → фоллбэк на noble/bookworm; совсем не поднялся → официальный
+# установщик как last-resort (громко, warn).
+CROWDSEC_FP="6A89E3C2303A901A889971D3376ED5326E93CD0C"
+setup_crowdsec_repo() {
+    local keyring=/etc/apt/keyrings/crowdsec-archive-keyring.gpg
+    local list=/etc/apt/sources.list.d/crowdsec.list
+    local os="$OS_ID" codename fb
+    codename="$(os_codename)"; [[ -n "$codename" ]] || codename=bookworm
+    mkdir -p /etc/apt/keyrings
+    if ! curl -fsSL --connect-timeout 5 --max-time 20 https://packagecloud.io/crowdsec/crowdsec/gpgkey \
+            | gpg --yes --dearmor -o "$keyring" 2>/dev/null; then
+        warn "ключ CrowdSec (packagecloud) недоступен"; rm -f "$keyring"; return 1
+    fi
+    if ! gpg --show-keys --with-colons "$keyring" 2>/dev/null \
+            | awk -F: '/^fpr:/{print $10}' | grep -qx "$CROWDSEC_FP"; then
+        warn "отпечаток ключа CrowdSec не совпал с $CROWDSEC_FP — отказываюсь использовать"
+        rm -f "$keyring"; return 1
+    fi
+    chmod 0644 "$keyring"
+    echo "deb [signed-by=$keyring] https://packagecloud.io/crowdsec/crowdsec/$os $codename main" > "$list"
+    if ! apt-get update -qq 2>/dev/null; then
+        fb=bookworm; [[ "$os" == "ubuntu" ]] && fb=noble
+        if [[ "$codename" != "$fb" ]]; then
+            warn "suite '$codename' в репо CrowdSec не поднялся — пробую '$fb'"
+            echo "deb [signed-by=$keyring] https://packagecloud.io/crowdsec/crowdsec/$os $fb main" > "$list"
+            if ! apt-get update -qq 2>/dev/null; then
+                rm -f "$list"; apt-get update -qq 2>/dev/null || true; return 1
+            fi
+        else
+            rm -f "$list"; apt-get update -qq 2>/dev/null || true; return 1
+        fi
+    fi
+    return 0
+}
+
+# PROBE: репозиторий+ключ+пакеты CrowdSec резолвятся на этой ОС, БЕЗ установки.
+# Для CI-матрицы и ops-проверки совместимости (аналог XANMOD_PROBE в optimize.sh).
+if [[ "${CROWDSEC_PROBE:-0}" == "1" ]]; then
+    setup_crowdsec_repo || { err "CROWDSEC_PROBE: репозиторий не поднялся"; exit 1; }
+    apt-cache show crowdsec >/dev/null 2>&1 \
+        && ok "CROWDSEC_PROBE: пакет crowdsec резолвится" \
+        || { err "CROWDSEC_PROBE: пакет crowdsec не резолвится"; exit 1; }
+    apt-cache show crowdsec-firewall-bouncer-nftables >/dev/null 2>&1 \
+        && ok "CROWDSEC_PROBE: bouncer резолвится" \
+        || warn "CROWDSEC_PROBE: crowdsec-firewall-bouncer-nftables не резолвится в этом suite"
+    exit 0
+fi
 
 # ─── Сейфти-таймер: если потеряем SSH — снести нашу таблицу через N сек ───────
 arm_safety() {
@@ -335,7 +394,7 @@ fi
 FLEET_ON=0
 case "$FLEET_SYNC" in
     1) FLEET_ON=1;;
-    auto) [[ -n "$REMNAWAVE_URL" && -n "$REMNAWAVE_TOKEN" ]] && FLEET_ON=1 \
+    auto) { [[ -n "$REMNAWAVE_URL" && -n "$REMNAWAVE_TOKEN" ]] || [[ -n "$REMNAWAVE_NODES_URL" ]]; } && FLEET_ON=1 \
           || { [[ -f "$CONF_DIR/fleet.env" ]] && FLEET_ON=1; };;
 esac
 FLEET_SETS=""; FLEET_ACCEPT=""
@@ -537,11 +596,16 @@ ok "na-firewall.service включён (правила переживут reboot
 if [[ "$ENABLE_CROWDSEC" == "1" ]]; then
     title "CrowdSec + nftables firewall-bouncer"
     if ! command -v cscli >/dev/null 2>&1; then
-        info "Подключаю репозиторий CrowdSec..."
-        # -fsSL (а не -s): при HTTP-ошибке/редиректе curl падает, а не отдаёт HTML в bash.
-        # Это официальный установщик CrowdSec; для жёсткого пиннинга — ставить из их APT-репо.
-        curl -fsSL https://install.crowdsec.net | bash >/dev/null 2>&1 || warn "install.crowdsec.net недоступен"
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq crowdsec >/dev/null 2>&1 || warn "crowdsec не установился"
+        info "Подключаю APT-репозиторий CrowdSec (пиннингованный ключ $CROWDSEC_FP)…"
+        if setup_crowdsec_repo; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq crowdsec >/dev/null 2>&1 || warn "crowdsec не установился"
+        else
+            # last-resort: официальный установщик. -fsSL (а не -s): при HTTP-ошибке/
+            # редиректе curl падает, а не отдаёт HTML в bash.
+            warn "пиннингованный репо не поднялся — fallback на официальный установщик (curl|bash)"
+            curl -fsSL https://install.crowdsec.net | bash >/dev/null 2>&1 || warn "install.crowdsec.net недоступен"
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq crowdsec >/dev/null 2>&1 || warn "crowdsec не установился"
+        fi
     fi
     if command -v cscli >/dev/null 2>&1; then
         systemctl enable --now crowdsec >/dev/null 2>&1 || true
@@ -622,40 +686,67 @@ fi
 # ── Fleet auto-sync: ноды флота из Remnawave-панели → nft-сет na_fleet_* ──────
 if [[ "$FLEET_ON" == "1" ]]; then
     title "Fleet auto-sync (ноды флота → whitelist)"
-    if [[ -n "$REMNAWAVE_URL" && -n "$REMNAWAVE_TOKEN" ]]; then
+    if [[ -n "$REMNAWAVE_NODES_URL" ]] || [[ -n "$REMNAWAVE_URL" && -n "$REMNAWAVE_TOKEN" ]]; then
         umask 077; mkdir -p "$CONF_DIR"
-        printf 'REMNAWAVE_URL=%s\nREMNAWAVE_TOKEN=%s\n' "$REMNAWAVE_URL" "$REMNAWAVE_TOKEN" > "$CONF_DIR/fleet.env"
+        {
+            [[ -z "$REMNAWAVE_URL"       ]] || printf 'REMNAWAVE_URL=%s\n' "$REMNAWAVE_URL"
+            [[ -z "$REMNAWAVE_TOKEN"     ]] || printf 'REMNAWAVE_TOKEN=%s\n' "$REMNAWAVE_TOKEN"
+            [[ -z "$REMNAWAVE_NODES_URL" ]] || printf 'REMNAWAVE_NODES_URL=%s\n' "$REMNAWAVE_NODES_URL"
+        } > "$CONF_DIR/fleet.env"
         chmod 0600 "$CONF_DIR/fleet.env"; chown root:root "$CONF_DIR/fleet.env" 2>/dev/null || true
-        ok "токен панели сохранён в $CONF_DIR/fleet.env (root:root 0600, НЕ в protect.conf)"
+        if [[ -n "$REMNAWAVE_NODES_URL" ]]; then
+            ok "источник нод сохранён в $CONF_DIR/fleet.env (NODES_URL — без API-токена на ноде)"
+        else
+            ok "токен панели сохранён в $CONF_DIR/fleet.env (root:root 0600, НЕ в protect.conf)"
+        fi
     elif [[ -f "$CONF_DIR/fleet.env" ]]; then
         info "использую сохранённый $CONF_DIR/fleet.env"
     fi
     cat > /usr/local/sbin/na-fleet-sync <<'FSYNC'
 #!/usr/bin/env bash
-# na-fleet-sync — тянет адреса нод флота из Remnawave (GET /api/nodes по Bearer) и
-# держит их в nft-сете na_fleet_v4/v6 (accept сразу после whitelist). Токен уходит
-# ТОЛЬКО на заданный оператором $REMNAWAVE_URL. Fail-safe: панель недоступна / кривой
-# ответ / 0 валидных IP → текущий whitelist нод НЕ трогаем (last-known-good). Применение
-# отдельной nft-транзакцией: битые данные не ломают na_filter.
+# na-fleet-sync — держит адреса нод флота в nft-сете na_fleet_v4/v6 (accept сразу
+# после whitelist). Источник (из /etc/node-accelerator/fleet.env):
+#   1) REMNAWAVE_NODES_URL — статический список БЕЗ токена панели на ноде: JSON того же
+#      вида, что /api/nodes, ИЛИ plain-text «адрес на строку» (# — комментарий).
+#   2) REMNAWAVE_URL + REMNAWAVE_TOKEN — GET /api/nodes по Bearer. Токен уходит ТОЛЬКО
+#      на заданный оператором URL.
+# Fail-safe: источник недоступен / кривой ответ / 0 валидных IP → текущий whitelist нод
+# НЕ трогаем (last-known-good). Применение отдельной nft-транзакцией: битые данные не
+# ломают na_filter. Успех отмечается в /var/lib/node-accelerator/fleet-sync.last —
+# na-diagnose показывает возраст последнего синка (протухший токен виден, а не молчит).
 set -u
 TAG=na-fleet-sync
 ENVF=/etc/node-accelerator/fleet.env
+STAMP=/var/lib/node-accelerator/fleet-sync.last
 [ -r "$ENVF" ] || { logger -t "$TAG" "нет $ENVF — выкл"; exit 0; }
 # shellcheck disable=SC1090
 . "$ENVF"
-URL="${REMNAWAVE_URL:-}"; TOKEN="${REMNAWAVE_TOKEN:-}"
-[ -n "$URL" ] && [ -n "$TOKEN" ] || { logger -t "$TAG" "URL/TOKEN пуст — выкл"; exit 0; }
-URL="${URL%/}"
+URL="${REMNAWAVE_URL:-}"; TOKEN="${REMNAWAVE_TOKEN:-}"; NURL="${REMNAWAVE_NODES_URL:-}"
+{ [ -n "$NURL" ] || { [ -n "$URL" ] && [ -n "$TOKEN" ]; }; } || { logger -t "$TAG" "источник не задан — выкл"; exit 0; }
 command -v curl >/dev/null 2>&1 || { logger -t "$TAG" "нет curl"; exit 1; }
-command -v jq   >/dev/null 2>&1 || { logger -t "$TAG" "нет jq"; exit 1; }
 nft list set inet na_filter na_fleet_v4 >/dev/null 2>&1 || { logger -t "$TAG" "сет na_fleet нет (protect без fleet) — выкл"; exit 0; }
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-HTTP="$(curl -fsS --max-time 15 -o "$TMP/r.json" -w '%{http_code}' \
-        -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" \
-        "$URL/api/nodes" 2>/dev/null || true)"
-[ "$HTTP" = "200" ] && [ -s "$TMP/r.json" ] || { logger -t "$TAG" "панель недоступна (HTTP=$HTTP) — last-known-good"; exit 0; }
-jq -r '.. | objects | .address? // empty' "$TMP/r.json" 2>/dev/null | awk 'NF' | sort -u > "$TMP/addr"
-[ -s "$TMP/addr" ] || { logger -t "$TAG" "в ответе нет address — last-known-good"; exit 0; }
+if [ -n "$NURL" ]; then
+    SRC="$NURL"
+    HTTP="$(curl -fsS --max-time 15 -o "$TMP/r" -w '%{http_code}' "$NURL" 2>/dev/null || true)"
+else
+    command -v jq >/dev/null 2>&1 || { logger -t "$TAG" "нет jq (нужен для /api/nodes)"; exit 1; }
+    URL="${URL%/}"; SRC="$URL/api/nodes"
+    HTTP="$(curl -fsS --max-time 15 -o "$TMP/r" -w '%{http_code}' \
+            -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" \
+            "$SRC" 2>/dev/null || true)"
+fi
+[ "$HTTP" = "200" ] && [ -s "$TMP/r" ] || { logger -t "$TAG" "источник недоступен (HTTP=$HTTP) — last-known-good"; exit 0; }
+: > "$TMP/addr"
+if command -v jq >/dev/null 2>&1; then
+    jq -r '.. | objects | .address? // empty' "$TMP/r" 2>/dev/null | awk 'NF' >> "$TMP/addr" || true
+fi
+if [ ! -s "$TMP/addr" ] && [ -n "$NURL" ]; then
+    # plain-text режим NODES_URL: адрес/hostname на строку (валидация/резолв ниже)
+    sed -E 's/#.*$//' "$TMP/r" | awk 'NF{print $1}' >> "$TMP/addr"
+fi
+sort -u -o "$TMP/addr" "$TMP/addr"
+[ -s "$TMP/addr" ] || { logger -t "$TAG" "в ответе нет адресов — last-known-good"; exit 0; }
 : > "$TMP/v4"; : > "$TMP/v6"
 while IFS= read -r a; do
     [ -n "$a" ] || continue
@@ -676,7 +767,8 @@ V6="$(grep -E '^[0-9a-fA-F:]+$' "$TMP/v6" 2>/dev/null | grep ':' | sort -u | pas
 n4=$(printf '%s' "$V4" | tr ',' '\n' | grep -c . || true)
 n6=$(printf '%s' "$V6" | tr ',' '\n' | grep -c . || true)
 if nft -f "$TMP/upd.nft" 2>/dev/null; then
-    logger -t "$TAG" "whitelist нод обновлён: ${n4} v4 + ${n6} v6 (из $URL/api/nodes)"
+    mkdir -p /var/lib/node-accelerator && date +%s > "$STAMP"
+    logger -t "$TAG" "whitelist нод обновлён: ${n4} v4 + ${n6} v6 (из $SRC)"
 else
     logger -t "$TAG" "nft apply не прошёл — last-known-good сохранён"
 fi
@@ -754,6 +846,7 @@ N6="$(grep -c . "$TMP/v6.clean" 2>/dev/null || echo 0)"
     fi
 } > "$TMP/bl.nft"
 if nft -f "$TMP/bl.nft" 2>/dev/null; then
+    mkdir -p /var/lib/node-accelerator && date +%s > /var/lib/node-accelerator/blocklist.last
     logger -t "$TAG" "blocklist обновлён: ${N4} v4 + ${N6} v6"
 else
     logger -t "$TAG" "nft apply не прошёл — last-known-good"
@@ -983,6 +1076,7 @@ chmod +x /usr/local/sbin/na-fw-top-talkers
 mkdir -p "$STATE_DIR"
 cat > "$STATE_DIR/protect.installed" <<EOF
 installed_at=$(date -Is)
+na_version=$NA_VERSION
 backup=$BACKUP
 ssh_port=$SSH_PORT
 tcp_ports=$TCP_PORTS

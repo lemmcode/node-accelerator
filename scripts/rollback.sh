@@ -79,6 +79,7 @@ rollback_protect() {
     rm -f /etc/modules-load.d/na-synproxy.conf "$STATE_DIR/.synproxy-degraded"
     # конфиги: persisted protect.conf, ctguard.conf, токен панели fleet.env (custom-blocklist.txt — данные оператора, оставляем)
     rm -f "$STATE_DIR/protect.installed" "$CONF_DIR/protect.conf" "$CONF_DIR/ctguard.conf" "$CONF_DIR/fleet.env"
+    rm -f "$STATE_DIR/fleet-sync.last" "$STATE_DIR/blocklist.last"
     [[ -f "$CONF_DIR/custom-blocklist.txt" ]] && info "оставлен $CONF_DIR/custom-blocklist.txt (данные оператора)"
     ok "na_filter/na_ctguard удалены, сервисы и таймеры сняты"
 
