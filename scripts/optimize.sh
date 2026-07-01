@@ -108,12 +108,12 @@ setup_xanmod_repo() {
 
     xanmod_import_key "$keyring" || return 1
 
-    echo "deb [signed-by=$keyring] http://deb.xanmod.org $codename main" > "$list"
+    echo "deb [signed-by=$keyring] https://deb.xanmod.org $codename main" > "$list"
     if ! apt-get update -qq 2>/dev/null; then
         if [[ "$codename" != "bookworm" ]]; then
             warn "Suite '$codename' не поднялся — откатываюсь на 'bookworm' (LTS)"
             codename="bookworm"; XANMOD_FLAVOR="lts"
-            echo "deb [signed-by=$keyring] http://deb.xanmod.org $codename main" > "$list"
+            echo "deb [signed-by=$keyring] https://deb.xanmod.org $codename main" > "$list"
             apt-get update -qq 2>/dev/null || { warn "XanMod-репо недоступен"; rm -f "$list"; return 1; }
         else
             warn "XanMod-репо ('bookworm') недоступен"; rm -f "$list"; return 1
@@ -243,15 +243,20 @@ TFO_VAL=3; [[ "$DISABLE_TFO" == "1" ]] && TFO_VAL=0
 # таблицу. idle-туннели/мосты без частого keepalive могут поднять (напр. 14400=4ч).
 CT_EST_TIMEOUT="${CT_EST_TIMEOUT:-7440}"
 [[ "$CT_EST_TIMEOUT" =~ ^[0-9]+$ ]] && [[ "$CT_EST_TIMEOUT" -ge 120 && "$CT_EST_TIMEOUT" -le 432000 ]] || CT_EST_TIMEOUT=7440
+# qdisc: fq (дефолт, BBR-классика) | fq_codel | cake. BBR пейсит внутренне (ядро 4.20+),
+# так что cake — легальная альтернатива для bufferbloat-аплинков дешёвых VPS; включать
+# осознанно и сравнивать A/B (cake добавляет свой шейпинг-оверхед на PPS).
+QDISC="${QDISC:-fq}"
+[[ "$QDISC" =~ ^(fq|fq_codel|cake)$ ]] || { warn "QDISC='$QDISC' не из fq|fq_codel|cake — беру fq"; QDISC=fq; }
 # overcommit: на tier1 (≤1.2G) heuristic (0) безопаснее агрессивного always-overcommit (1).
 OVERCOMMIT=1; [[ "$TIER" -le 1 ]] && OVERCOMMIT=0
-info "RAM-tier $TIER (~${_mem_mb} MB): sock_max=$SOCK_MAX def=$SOCK_DEF ecn=$TCP_ECN_MODE tfo=$TFO_VAL overcommit=$OVERCOMMIT"
+info "RAM-tier $TIER (~${_mem_mb} MB): sock_max=$SOCK_MAX def=$SOCK_DEF ecn=$TCP_ECN_MODE tfo=$TFO_VAL overcommit=$OVERCOMMIT qdisc=$QDISC"
 backup_file /etc/sysctl.d/99-node-accelerator.conf "$BACKUP"
 cat > /etc/sysctl.d/99-node-accelerator.conf <<SYSCTL
 # === node-accelerator / optimize (RAM-tier $TIER, ~${_mem_mb} MB) ===
 
 # --- Network core ---
-net.core.default_qdisc            = fq
+net.core.default_qdisc            = $QDISC
 net.core.netdev_max_backlog       = 250000
 net.core.somaxconn                = 65535
 net.core.rmem_default             = $SOCK_DEF
@@ -461,6 +466,7 @@ RemainAfterExit=yes
 ExecStart=/bin/sh -c '\
     ethtool -G $NIC rx 4096 tx 4096 2>/dev/null || true; \
     ethtool -K $NIC gro on gso on tso on 2>/dev/null || true; \
+    ethtool -K $NIC lro off 2>/dev/null || true; \
     ip link set $NIC txqueuelen 10000 2>/dev/null || true'
 
 [Install]
@@ -468,7 +474,7 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     systemctl enable --now na-nic-tune.service >/dev/null 2>&1 || true
-    ok "NIC=$NIC: ring 4096, GRO/GSO/TSO on, txqueuelen 10000"
+    ok "NIC=$NIC: ring 4096, GRO/GSO/TSO on, LRO off, txqueuelen 10000"
 else
     warn "Основной интерфейс не определён — NIC tuning пропущен"
 fi
@@ -640,6 +646,7 @@ ok "irqbalance запущен"
 mkdir -p "$STATE_DIR"
 cat > "$STATE_DIR/optimize.installed" <<EOF
 installed_at=$(date -Is)
+na_version=$NA_VERSION
 backup=$BACKUP
 nic=${NIC:-none}
 xanmod=$([[ -f "$STATE_DIR/xanmod.pkg" ]] && cat "$STATE_DIR/xanmod.pkg" || echo none)
@@ -649,7 +656,7 @@ EOF
 # Персист конфига оптимизатора → ре-ран без ENV не сбрасывает выбор сборки/флейвора.
 save_conf "$CONF_DIR/optimize.conf" \
     ENABLE_XANMOD XANMOD_FLAVOR REMNAWAVE_SWAP_SIZE \
-    DISABLE_TFO TCP_ECN_MODE ENABLE_MSS_CLAMP SETUP_NO_ZRAM CT_EST_TIMEOUT
+    DISABLE_TFO TCP_ECN_MODE ENABLE_MSS_CLAMP SETUP_NO_ZRAM CT_EST_TIMEOUT QDISC
 
 title "ГОТОВО"
 ok "Оптимизатор применён."
