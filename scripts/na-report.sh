@@ -177,7 +177,7 @@ emit_json() {
     )"
 
     printf '{'
-    printf '"window_hours":%s,"generated_at":%s,"events_total":%s,"ban_rate_5m":%s,' "$HOURS" "$NOW" "$total" "$rate"
+    printf '"na_version":"%s","window_hours":%s,"generated_at":%s,"events_total":%s,"ban_rate_5m":%s,' "${NA_VERSION:-?}" "$HOURS" "$NOW" "$total" "$rate"
     printf '"drops_by_reason":{"portscan":%s,"synflood":%s,"ssh-flood":%s,"badflags":%s,"crowdsec":%s},' \
         "$portscan" "$synflood" "$sshflood" "$badflags" "$crowd"
     printf '"timeline":[%s],' "$tl"
@@ -408,7 +408,7 @@ proxyware_json() {
     files="$(pw_files)"; dock="$(pw_docker)"; c2="$(pw_c2conn)"; lst="$(pw_listeners)"
     if [[ -n "$proc$svc$cron$files$dock$c2" ]]; then verdict="suspect"; else verdict="clean"; fi
     printf '{'
-    printf '"verdict":"%s","generated_at":%s,' "$verdict" "$NOW"
+    printf '"na_version":"%s","verdict":"%s","generated_at":%s,' "${NA_VERSION:-?}" "$verdict" "$NOW"
     printf '"hits":{"processes":%s,"services":%s,"cron":%s,"files":%s,"docker":%s},' \
         "$(printf '%s\n' "$proc"  | _json_arr)" \
         "$(printf '%s\n' "$svc"   | _json_arr)" \
