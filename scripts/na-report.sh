@@ -113,7 +113,11 @@ enrich_asn() {
     query+=$'end\n'
     out="$(printf '%s' "$query" | whois -h whois.cymru.com 2>/dev/null)" || return 0
     while IFS= read -r line; do
-        [[ "$line" == AS*\|* ]] || continue
+        # Строки данных Cymru начинаются с ГОЛОГО номера ASN ("15169  | 1.2.3.4 | …"),
+        # НЕ с "AS". Старый guard `== AS*\|*` матчил только строку-ЗАГОЛОВОК → все данные
+        # отбрасывались, ASN/гео всегда пустые. Берём data-строки (≥2 разделителя),
+        # исключая заголовок (AS…) и служебную "Bulk mode…".
+        [[ "$line" == *\|*\|* && "$line" != AS*\|* && "$line" != Bulk* ]] || continue
         asn="$(echo "$line"  | awk -F'|' '{gsub(/ /,"",$1); print $1}')"
         ip="$(echo "$line"   | awk -F'|' '{gsub(/ /,"",$2); print $2}')"
         cc="$(echo "$line"   | awk -F'|' '{gsub(/ /,"",$4); print $4}')"
@@ -211,7 +215,7 @@ focus_ip() {
     [[ -n "${ASN[$ip]:-}" ]] && status_line OK "ASN: ${ASN[$ip]} ${ANAME[$ip]:-} (${CC[$ip]:-?})" || info "ASN: н/д (нужен whois)"
     # активные conntrack-сессии (если есть conntrack-tools)
     if command -v conntrack >/dev/null 2>&1; then
-        cc="$(conntrack -L 2>/dev/null | grep -c -- "$ip")"
+        cc="$(conntrack -L 2>/dev/null | grep -Fc -- "$ip")"   # -F: точки IPv4 как литералы, не regex-«любой символ»
         [[ "${cc:-0}" -gt 0 ]] && status_line WARN "активных conntrack-сессий: $cc" || info "активных conntrack-сессий: 0"
     fi
     info "Причины (за ${HOURS}ч):"

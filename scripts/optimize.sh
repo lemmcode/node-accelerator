@@ -30,6 +30,18 @@ detect_os
 # Подхватываем сохранённый конфиг оптимизатора (ENV по-прежнему переопределяет).
 load_conf "$CONF_DIR/optimize.conf"
 
+# DRY_RUN: protect.sh поддерживает полноценный dry-run (генерит ruleset, не применяет),
+# и пользователь по аналогии может ждать того же от `DRY_RUN=1 install.sh optimize|all`.
+# Оптимизатор же мутирует НЕОБРАТИМО (ставит ядро, свап, sysctl) — тихо отработать
+# «как будто dry-run» здесь опаснее, чем честно отказать. Выходим ДО любых мутаций.
+if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    info "DRY_RUN=1: детальный dry-run для оптимизатора НЕ поддержан (мутации ядро/свап/sysctl необратимы)."
+    info "Было бы сделано: XanMod (ENABLE_XANMOD=${ENABLE_XANMOD:-1}), sysctl (BBR/буферы/conntrack),"
+    info "  лимиты 1M, RPS/RFS/XPS, NIC-tune, swap/zram, journald-cap, THP=never, governor=performance."
+    info "Проверить XanMod-репо без установки: XANMOD_PROBE=1. Dry-run фаервола: DRY_RUN=1 protect.sh."
+    exit 0
+fi
+
 # Подчищаем ТОЛЬКО XanMod-репозитории с мёртвыми suite (focal/jammy/releases выпилены
 # из репо) — их 404 роняет 'apt-get update' на повторном прогоне через set -e. Рабочий
 # list НЕ трогаем: иначе на уже настроенной ноде молча отключатся обновления ядра.

@@ -66,8 +66,12 @@ arch() { uname -m; }
 # Тип виртуализации. "none" = железо/полноценная VM где можно ставить своё ядро.
 # Контейнеры (openvz/lxc/docker) делят ядро хоста — кастомное ядро туда не поставить.
 detect_virt() {
+    # systemd-detect-virt на железе САМ печатает "none" И выходит с кодом 1 → наивный
+    # `|| echo none` дописал бы ВТОРОЙ "none" (перевод строки внутри значения ломает
+    # `diagnose --json` на bare-metal-дедиках). Берём вывод как есть, пустое → none.
+    local v
     if command -v systemd-detect-virt >/dev/null 2>&1; then
-        systemd-detect-virt 2>/dev/null || echo none
+        v="$(systemd-detect-virt 2>/dev/null || true)"; echo "${v:-none}"
     else
         echo unknown
     fi
